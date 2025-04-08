@@ -13,10 +13,14 @@
 # Using StereoscoPy to Generate Red-Cyan stereoscopic pairs
 install: pip install stereoscopy
 ---
-CIL: StereoscoPy -S 5 0 -a -m color --cs red-cyan --lc rgb imgs_ss/11040035_l.png imgs_ss/11040035_r.png results/anaglyph_color_rc.jpg\
+CIL: StereoscoPy -S 5 0 -a -m color --cs red-cyan --lc rgb .\left_repaired.png .\right_repaired.png red_cyan.jpg\
 -A: autoalignment(should be off)\
 -a: anaglyph output\
 -S: xy shift for left/right image\
 -m: method\
 -cs: color scheme (should be red-cyan)\
 --lc: luma coding (should be rgb)
+
+Generate StereoPairs from left and right:
+ffmpeg -i .\left_repaired.png -i .\right_repaired.png -filter_complex "[0:v]scale=512:256[img1];[img1][1:v]hstack" stereo.jpg
+ffmpeg -loop 1 -i .\stereo.jpg -c:v libx264 -t 60 -pix_fmt yuv420p stereo_output.mp4

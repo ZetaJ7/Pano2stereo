@@ -3,11 +3,15 @@ import math, os
 import pyexr
 import matplotlib.pyplot as plt
 import cv2
+import logging
+import subprocess
+from pathlib import Path
 from tqdm import tqdm
 
-RADIUS = 0.32           # 视环半径 32cm
-PRO_RADIUS = 1       # 视环投影半径 1m
-CRITICAL_DEPTH = 25     # 临界深度 25m
+RADIUS = 0.032                  # 视环半径(m) 
+PRO_RADIUS = 1                  # 视环投影半径(m) 
+PIXEL = 4448                    # 赤道图像宽度 4448(pixel)
+CRITICAL_DEPTH_SET = 9999       # 临界深度(m)
 
 # def image_coords_to_uv(image_width, image_height):
 #     # 生成网格坐标 (x, y)
@@ -21,6 +25,9 @@ CRITICAL_DEPTH = 25     # 临界深度 25m
     
 #     return np.stack([u, v], axis=-1)  # 返回形状 (H, W, 2)
 
+def cal_critical_depth(r, pixel):
+    return r/(math.sin(2*math.pi/pixel))
+
 def image_coords_to_sphere(image_width, image_height, x=None, y=None):
     """
     将图像坐标 (x, y) 转换为球面坐标 (r, θ, φ)
@@ -33,7 +40,7 @@ def image_coords_to_sphere(image_width, image_height, x=None, y=None):
         
     返回:
         sphere_coords (array): 球面坐标数组，形状 (H, W, 3) 或单个坐标 (3,)
-    """
+    """ 
     # 生成全图网格或处理单个坐标
     if x is None or y is None:
         x = np.arange(image_width)
@@ -133,8 +140,13 @@ def sphere2pano(sphere, z, r=RADIUS):
     phi_l = (phi + delta) % (2 * np.pi)  # 确保在 [0, 2π] 范围内
     phi_r = (phi - delta) % (2 * np.pi)  # 确保在 [0, 2π] 范围内
 
-    sphere_l = np.stack([R, theta, phi_l], axis=-1)
-    sphere_r = np.stack([R, theta, phi_r], axis=-1)
+    # fix theta
+    # theta_l = math.atan((math.sqrt(z**2 - r**2) /z) * math.tan(theta)) 
+    theta_l = theta
+    theta_r = theta_l
+
+    sphere_l = np.stack([R, theta_l, phi_l], axis=-1)
+    sphere_r = np.stack([R, theta_r, phi_r], axis=-1)
     
     return sphere_l, sphere_r
 
@@ -213,33 +225,23 @@ def generate_stereo_pair(rgb_data, depth_data):
 
     return left, right
 
-def bilinear_interpolate(image, x, y):
-    h, w = image.shape[:2]
-    x0 = np.floor(x).astype(int)
-    y0 = np.floor(y).astype(int)
-    x1 = x0 + 1
-    y1 = y0 + 1
-
-    x0 = np.clip(x0, 0, w-1)
-    x1 = np.clip(x1, 0, w-1)
-    y0 = np.clip(y0, 0, h-1)
-    y1 = np.clip(y1, 0, h-1)
-
-    Ia = image[y0, x0]
-    Ib = image[y1, x0]
-    Ic = image[y0, x1]
-    Id = image[y1, x1]
-
-    wa = (x1 - x) * (y1 - y)
-    wb = (x1 - x) * (y - y0)
-    wc = (x - x0) * (y1 - y)
-    wd = (x - x0) * (y - y0)
-
-    return wa[..., None] * Ia + wb[..., None] * Ib + wc[..., None] * Ic + wd[..., None] * Id
+def repair_black_regions(image):
+    # 转换到BGR格式用于OpenCV处理
+    img_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    # 创建掩膜（黑色区域为255，其他为0）
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    mask = np.uint8(gray == 0) * 255
+    # 使用Telea算法进行修复
+    repaired = cv2.inpaint(img_bgr, mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+    return cv2.cvtColor(repaired, cv2.COLOR_BGR2RGB)
 
 if __name__ == "__main__":
-    img_path = "3D60/1_color_0_Left_Down_0.0.png"
+    # img_path = "3D60/1_color_0_Left_Down_0.0.png"
+    img_path = "3D60/2_color_0_Left_Down_0.0.png"
     depth_path = img_path.replace("color", "depth").replace(".png", ".exr")
+    CRITICAL_DEPTH = cal_critical_depth(RADIUS, PIXEL)
+    CRITICAL_DEPTH = min(CRITICAL_DEPTH, CRITICAL_DEPTH_SET)
+    print('[Stereo Parameters]\nCircular Radius: %sm\nProjection Radius: %sm\nPixel on Equator: %s\nCritical Depth: %sm\n' % (RADIUS, PRO_RADIUS, PIXEL, CRITICAL_DEPTH))
     
     exr_data = pyexr.read(depth_path)
     depth = exr_data[..., 0].copy()
@@ -255,9 +257,64 @@ if __name__ == "__main__":
     
     left_bgr = cv2.cvtColor(left, cv2.COLOR_RGB2BGR)
     right_bgr = cv2.cvtColor(right, cv2.COLOR_RGB2BGR)
-    os.makedirs("output", exist_ok=True)
+    os.makedirs("output", exist_ok = True)
     cv2.imwrite("output/left.png", left_bgr)
     cv2.imwrite("output/right.png", right_bgr)
+
+    left_repaired = repair_black_regions(left)
+    right_repaired = repair_black_regions(right)
+
+    cv2.imwrite("output/left_repaired.png", cv2.cvtColor(left_repaired, cv2.COLOR_RGB2BGR))
+    cv2.imwrite("output/right_repaired.png", cv2.cvtColor(right_repaired, cv2.COLOR_RGB2BGR))
+
+    # 获取输出目录绝对路径
+    output_dir = Path("output").absolute()
+
+    try:
+        # 执行立体图像生成
+        subprocess.run([
+            "StereoscoPy",
+            "-S", "5", "0",
+            "-a",
+            "-m", "color",
+            "--cs", "red-cyan",
+            "--lc", "rgb",
+            str(output_dir/"left_repaired.png"),
+            str(output_dir/"right_repaired.png"),
+            str(output_dir/"red_cyan.jpg")
+        ], check=True)
+
+        # 执行水平拼接
+        subprocess.run([
+            "ffmpeg",
+            "-y",  # 覆盖已有文件
+            "-i", str(output_dir/"left_repaired.png"),
+            "-i", str(output_dir/"right_repaired.png"),
+            "-filter_complex",
+            "[0:v]scale=512:256[img1];[img1][1:v]hstack",
+            str(output_dir/"stereo.jpg")
+        ], check=True)
+
+        # 生成循环视频
+        subprocess.run([
+            "ffmpeg",
+            "-y",
+            "-loop", "1",
+            "-i", str(output_dir/"stereo.jpg"),
+            "-c:v", "libx264",
+            "-t", "60",
+            "-pix_fmt", "yuv420p",
+            "-vf", "fps=30",
+            str(output_dir/"stereo_output.mp4")
+        ], check=True)
+
+    except subprocess.CalledProcessError as e:
+        print(f"命令执行失败: {e.returncode}\n{e.stderr}")
+    except Exception as e:
+        print(f"处理出错: {str(e)}")
+    else:
+        print("立体图像和视频生成完成")
+
 
 
 
