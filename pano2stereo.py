@@ -1,4 +1,5 @@
 import numpy as np
+import threading
 import math, os
 import pyexr
 import matplotlib.pyplot as plt
@@ -185,42 +186,6 @@ def normalize_channel(data, percentile=99):
     normalized = (data - min_val) / (max_val - min_val + 1e-8)
     return normalized
 
-def generate_stereo_pair(rgb_data, depth_data, r, critical_depth):
-    H, W = rgb_data.shape[:2]
-    sphere_coords = image_coords_to_sphere(W, H)  # 生成球面坐标
-    
-    # 明确初始化类型为 uint8
-    left = np.zeros_like(rgb_data)
-    right = np.zeros_like(rgb_data)
-    z_left = np.full((H, W), np.inf)
-    z_right = np.full((H, W), np.inf)
-
-    for h0 in tqdm(range(H)):
-        for w0 in range(W):
-            z = depth_data[h0, w0]
-            if z <= 0 or z >= critical_depth:
-                continue
-
-            sphere = sphere_coords[h0, w0]
-            sphere_l, sphere_r = sphere2pano(sphere, z, r, critical_depth)
-
-            coord_l = sphere_to_image_coords(sphere_l, W, H)
-            xl, yl = coord_l[0], coord_l[1]
-            coord_r = sphere_to_image_coords(sphere_r, W, H)
-            xr, yr = coord_r[0], coord_r[1]
-
-            if 0 <= xl < W and 0 <= yl < H:
-                if z < z_left[yl, xl]:
-                    left[yl, xl] = rgb_data[h0, w0]
-                    z_left[yl, xl] = z
-
-            if 0 <= xr < W and 0 <= yr < H:
-                if z < z_right[yr, xr]:
-                    right[yr, xr] = rgb_data[h0, w0]
-                    z_right[yr, xr] = z
-
-    return left, right
-
 def repair_black_regions(image):
     # 转换到BGR格式用于OpenCV处理
     img_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
@@ -286,41 +251,41 @@ def generate_stereo_pair_vectorized(rgb_data, depth_data,r, critical_depth):
     z_left = np.full((H, W), np.inf)
     z_right = np.full((H, W), np.inf)
 
-    def process_eye(x_dest, y_dest, z_buffer):
-        """通用处理逻辑：处理单侧投影"""
-        # 有效性掩膜
+    def process_eye_wrapper(x_dest, y_dest, result, z_buffer):
+        """线程安全处理包装器"""
+        src_y, src_x, dest_y, dest_x, z_vals = process_eye(x_dest, y_dest)
+        with threading.Lock():
+            result[dest_y, dest_x] = rgb_data[src_y, src_x]
+            z_buffer[dest_y, dest_x] = z_vals
+    
+    def process_eye(x_dest, y_dest):
+        """优化后的处理逻辑"""
         valid = (x_dest >= 0) & (x_dest < W) & (y_dest >= 0) & (y_dest < H)
-        
-        # 获取有效坐标
         dest_indices = y_dest[valid] * W + x_dest[valid]
         source_idx = np.where(valid)
         z_values = depth_data[source_idx]
         
-        # 按深度排序保证优先处理最近像素
         sorted_idx = np.argsort(z_values)
-        sorted_dest = dest_indices[sorted_idx]
-        
-        # 保留每个目标位置的最小深度像素
-        _, unique_idx = np.unique(sorted_dest, return_index=True)
+        _, unique_idx = np.unique(dest_indices[sorted_idx], return_index=True)
         selected = sorted_idx[unique_idx]
         
-        return (
-            source_idx[0][selected],  # 源Y坐标
-            source_idx[1][selected],   # 源X坐标
-            y_dest[valid][selected],   # 目标Y坐标
-            x_dest[valid][selected],   # 目标X坐标
-            z_values[selected]         # 深度值
-        )
+        return (source_idx[0][selected], 
+                source_idx[1][selected],
+                y_dest[valid][selected],
+                x_dest[valid][selected],
+                z_values[selected])
 
-    # 处理左眼
-    src_y_l, src_x_l, dest_y_l, dest_x_l, z_l = process_eye(xl, yl, z_left)
-    left[dest_y_l, dest_x_l] = rgb_data[src_y_l, src_x_l]
-    z_left[dest_y_l, dest_x_l] = z_l
-
-    # 处理右眼
-    src_y_r, src_x_r, dest_y_r, dest_x_r, z_r = process_eye(xr, yr, z_right)
-    right[dest_y_r, dest_x_r] = rgb_data[src_y_r, src_x_r]
-    z_right[dest_y_r, dest_x_r] = z_r
+    # 创建并启动线程
+    threads = []
+    threads.append(threading.Thread(target=process_eye_wrapper, 
+                                 args=(xl, yl, left, z_left)))
+    threads.append(threading.Thread(target=process_eye_wrapper,
+                                 args=(xr, yr, right, z_right)))
+    
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
 
     t2 = cv2.getTickCount()
     time = (t2 - t1) / cv2.getTickFrequency()
@@ -328,8 +293,9 @@ def generate_stereo_pair_vectorized(rgb_data, depth_data,r, critical_depth):
     return left, right
 
 def main():
-    img_path = "3D60/1_color_0_Left_Down_0.0.png"
+    # img_path = "3D60/1_color_0_Left_Down_0.0.png"
     # img_path = "3D60/2_color_0_Left_Down_0.0.png"
+    img_path = "Lab_data/Lab1.png"
     # img_path = "Lab_data/Lab2.jpg"
     if not os.path.exists(img_path):
         raise FileNotFoundError(f"无法读取图像文件: {img_path}")
@@ -361,7 +327,6 @@ def main():
     assert rgb_array.shape[:2] == depth.shape[:2]
     height, width = rgb_array.shape[:2]
 
-    # left, right = generate_stereo_pair(rgb_array, depth, r=RADIUS, critical_depth=CRITICAL_DEPTH)
     left,right = generate_stereo_pair_vectorized(rgb_array, depth, r=RADIUS, critical_depth=CRITICAL_DEPTH)
     
     left_bgr = cv2.cvtColor(left, cv2.COLOR_RGB2BGR)
