@@ -1,3 +1,2 @@
-output*/
-channel_visualizations/
+results/*
 *.pth

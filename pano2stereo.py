@@ -9,11 +9,6 @@ from pathlib import Path
 from tqdm import tqdm
 from depth_estimate import depth_estimation
 
-RADIUS = 0.032                  # 视环半径(m) 
-PRO_RADIUS = 1                  # 视环投影半径(m) 
-PIXEL = 4448                    # 赤道图像宽度 4448(pixel)
-CRITICAL_DEPTH_SET = 9999       # 临界深度(m)
-
 # def image_coords_to_uv(image_width, image_height):
 #     # 生成网格坐标 (x, y)
 #     x = np.arange(image_width)
@@ -123,8 +118,8 @@ def sphere_to_image_coords(sphere_coords, image_width, image_height):
     
     return image_coords
 
-def sphere2pano(sphere, z, r=RADIUS):
-    if z >= CRITICAL_DEPTH:
+def sphere2pano(sphere, z, r, critical_depth):
+    if z >= critical_depth:
         return sphere, sphere
 
     R = sphere[..., 0]
@@ -190,7 +185,7 @@ def normalize_channel(data, percentile=99):
     normalized = (data - min_val) / (max_val - min_val + 1e-8)
     return normalized
 
-def generate_stereo_pair(rgb_data, depth_data):
+def generate_stereo_pair(rgb_data, depth_data, r, critical_depth):
     H, W = rgb_data.shape[:2]
     sphere_coords = image_coords_to_sphere(W, H)  # 生成球面坐标
     
@@ -203,11 +198,11 @@ def generate_stereo_pair(rgb_data, depth_data):
     for h0 in tqdm(range(H)):
         for w0 in range(W):
             z = depth_data[h0, w0]
-            if z <= 0 or z >= CRITICAL_DEPTH:
+            if z <= 0 or z >= critical_depth:
                 continue
 
             sphere = sphere_coords[h0, w0]
-            sphere_l, sphere_r = sphere2pano(sphere, z)
+            sphere_l, sphere_r = sphere2pano(sphere, z, r, critical_depth)
 
             coord_l = sphere_to_image_coords(sphere_l, W, H)
             xl, yl = coord_l[0], coord_l[1]
@@ -236,7 +231,7 @@ def repair_black_regions(image):
     repaired = cv2.inpaint(img_bgr, mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
     return cv2.cvtColor(repaired, cv2.COLOR_BGR2RGB)
 
-def make_output_dir(base_dir='output'):
+def make_output_dir(base_dir='results/output'):
     index = 0
     while True:
         target_dir = f"{base_dir}_{index:03d}" if index >= 0 else base_dir
@@ -248,16 +243,105 @@ def make_output_dir(base_dir='output'):
 
 def save_depth_map(depth, output_path):
     min,max = depth.min(), depth.max()
-    print(f'Depth min: {min}, max: {max}')
+    print(f'Depth min: {min}, max: {max}\n-------------------')
     depth_normalized = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX)
     depth_uint8 = depth_normalized.astype(np.uint8)
     cv2.imwrite('{}/depth.png'.format(output_path), depth_uint8)
 
-if __name__ == "__main__":
-    # img_path = "3D60/1_color_0_Left_Down_0.0.png"
+def sphere2pano_vectorized(sphere_coords, z_vals, r, critical_depth):
+    R = sphere_coords[..., 0]
+    theta = sphere_coords[..., 1]
+    phi = sphere_coords[..., 2]
+
+    mask = z_vals < critical_depth
+    ratio = np.clip(r / np.where(mask, z_vals, np.inf), -1.0, 1.0)
+    delta = np.arcsin(ratio)
+
+    phi_l = (phi + delta) % (2 * np.pi)
+    phi_r = (phi - delta) % (2 * np.pi)
+
+    return (
+        np.stack([R, theta, phi_l], axis=-1),
+        np.stack([R, theta, phi_r], axis=-1)
+    )
+
+def generate_stereo_pair_vectorized(rgb_data, depth_data,r, critical_depth):
+    print("======================\nGenerating stereo pair...")
+    t1 = cv2.getTickCount()
+    H, W = rgb_data.shape[:2]
+    sphere_coords = image_coords_to_sphere(W, H)
+    
+    # 计算左右投影坐标
+    sphere_l, sphere_r = sphere2pano_vectorized(sphere_coords, depth_data, r, critical_depth)
+    
+    # 转换到图像坐标系
+    coords_l = sphere_to_image_coords(sphere_l, W, H)
+    coords_r = sphere_to_image_coords(sphere_r, W, H)
+    xl, yl = coords_l[..., 0], coords_l[..., 1]
+    xr, yr = coords_r[..., 0], coords_r[..., 1]
+
+    # 初始化输出图像和深度缓冲区
+    left = np.zeros_like(rgb_data)
+    right = np.zeros_like(rgb_data)
+    z_left = np.full((H, W), np.inf)
+    z_right = np.full((H, W), np.inf)
+
+    def process_eye(x_dest, y_dest, z_buffer):
+        """通用处理逻辑：处理单侧投影"""
+        # 有效性掩膜
+        valid = (x_dest >= 0) & (x_dest < W) & (y_dest >= 0) & (y_dest < H)
+        
+        # 获取有效坐标
+        dest_indices = y_dest[valid] * W + x_dest[valid]
+        source_idx = np.where(valid)
+        z_values = depth_data[source_idx]
+        
+        # 按深度排序保证优先处理最近像素
+        sorted_idx = np.argsort(z_values)
+        sorted_dest = dest_indices[sorted_idx]
+        
+        # 保留每个目标位置的最小深度像素
+        _, unique_idx = np.unique(sorted_dest, return_index=True)
+        selected = sorted_idx[unique_idx]
+        
+        return (
+            source_idx[0][selected],  # 源Y坐标
+            source_idx[1][selected],   # 源X坐标
+            y_dest[valid][selected],   # 目标Y坐标
+            x_dest[valid][selected],   # 目标X坐标
+            z_values[selected]         # 深度值
+        )
+
+    # 处理左眼
+    src_y_l, src_x_l, dest_y_l, dest_x_l, z_l = process_eye(xl, yl, z_left)
+    left[dest_y_l, dest_x_l] = rgb_data[src_y_l, src_x_l]
+    z_left[dest_y_l, dest_x_l] = z_l
+
+    # 处理右眼
+    src_y_r, src_x_r, dest_y_r, dest_x_r, z_r = process_eye(xr, yr, z_right)
+    right[dest_y_r, dest_x_r] = rgb_data[src_y_r, src_x_r]
+    z_right[dest_y_r, dest_x_r] = z_r
+
+    t2 = cv2.getTickCount()
+    time = (t2 - t1) / cv2.getTickFrequency()
+    print(f"Panoramic processing time: {time:.4f} seconds\n======================")
+    return left, right
+
+def main():
+    img_path = "3D60/1_color_0_Left_Down_0.0.png"
     # img_path = "3D60/2_color_0_Left_Down_0.0.png"
-    CRITICAL_DEPTH = cal_critical_depth(RADIUS, PIXEL)
-    CRITICAL_DEPTH = min(CRITICAL_DEPTH, CRITICAL_DEPTH_SET)
+    # img_path = "Lab_data/Lab2.jpg"
+    if not os.path.exists(img_path):
+        raise FileNotFoundError(f"无法读取图像文件: {img_path}")
+    
+    RADIUS = 0.032                  # 视环半径(m) 
+    PRO_RADIUS = 1                  # 视环投影半径(m) 
+    PIXEL = 4448                    # 赤道图像宽度 4448(pixel)
+    CRITICAL_DEPTH = 9999           # 临界深度(m)
+    GENERATE_VIDEO = 0              # 是否生成视频
+
+    CRITICAL_DEPTH_CAL = cal_critical_depth(RADIUS, PIXEL)
+    CRITICAL_DEPTH = min(CRITICAL_DEPTH, CRITICAL_DEPTH_CAL)
     print('----- [Stereo Parameters] -----\nCircular Radius: %sm\nProjection Radius: %sm\nPixel on Equator: %s\nCritical Depth: %sm\n===============================' % (RADIUS, PRO_RADIUS, PIXEL, CRITICAL_DEPTH))
 
     # Depth From GT
@@ -266,7 +350,6 @@ if __name__ == "__main__":
     # depth = exr_data[..., 0].copy()
 
     # Depth From Estimation
-    img_path = "Lab_data/Lab2_fix.png"
     depth = depth_estimation(cv2.imread(img_path), max_depth=20)  # max_depth: 20 for indoor model, 80 for outdoor model
 
 
@@ -278,7 +361,8 @@ if __name__ == "__main__":
     assert rgb_array.shape[:2] == depth.shape[:2]
     height, width = rgb_array.shape[:2]
 
-    left, right = generate_stereo_pair(rgb_array, depth)
+    # left, right = generate_stereo_pair(rgb_array, depth, r=RADIUS, critical_depth=CRITICAL_DEPTH)
+    left,right = generate_stereo_pair_vectorized(rgb_array, depth, r=RADIUS, critical_depth=CRITICAL_DEPTH)
     
     left_bgr = cv2.cvtColor(left, cv2.COLOR_RGB2BGR)
     right_bgr = cv2.cvtColor(right, cv2.COLOR_RGB2BGR)
@@ -297,6 +381,7 @@ if __name__ == "__main__":
     # 获取输出目录绝对路径
     output_dir = Path(output_dir).absolute()
 
+  
     try:
         # 执行立体图像生成
         subprocess.run([
@@ -323,18 +408,19 @@ if __name__ == "__main__":
             str(output_dir/"stereo.jpg")
         ], check=True)
 
-        # 生成循环视频
-        subprocess.run([
-            "ffmpeg",
-            "-y",
-            "-loop", "1",
-            "-i", str(output_dir/"stereo.jpg"),
-            "-c:v", "libx264",
-            "-t", "60",
-            "-pix_fmt", "yuv420p",
-            "-vf", "fps=30",
-            str(output_dir/"stereo_output.mp4")
-        ], check=True)
+        if GENERATE_VIDEO:      
+            # 生成循环视频
+            subprocess.run([
+                "ffmpeg",
+                "-y",
+                "-loop", "1",
+                "-i", str(output_dir/"stereo.jpg"),
+                "-c:v", "libx264",
+                "-t", "60",
+                "-pix_fmt", "yuv420p",
+                "-vf", "fps=30",
+                str(output_dir/"stereo_output.mp4")
+            ], check=True)
 
     except subprocess.CalledProcessError as e:
         print(f"命令执行失败: {e.returncode}\n{e.stderr}")
@@ -342,9 +428,11 @@ if __name__ == "__main__":
         print(f"处理出错: {str(e)}")
     else:
         print("立体图像和视频生成完成")
-        print(f"输出目录: {output_dir}")
+        
+    print(f"输出目录: {output_dir}")
 
-
+if __name__ == "__main__":
+    main()
 
 
 
