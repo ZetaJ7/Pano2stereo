@@ -7,6 +7,7 @@ import logging
 import subprocess
 from pathlib import Path
 from tqdm import tqdm
+from depth_estimate import depth_estimation
 
 RADIUS = 0.032                  # 视环半径(m) 
 PRO_RADIUS = 1                  # 视环投影半径(m) 
@@ -235,16 +236,39 @@ def repair_black_regions(image):
     repaired = cv2.inpaint(img_bgr, mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
     return cv2.cvtColor(repaired, cv2.COLOR_BGR2RGB)
 
+def make_output_dir(base_dir='output'):
+    index = 0
+    while True:
+        target_dir = f"{base_dir}_{index:03d}" if index >= 0 else base_dir
+        if not os.path.exists(target_dir):
+            os.makedirs(target_dir)
+            break
+        index += 1
+    return target_dir
+
+def save_depth_map(depth, output_path):
+    min,max = depth.min(), depth.max()
+    print(f'Depth min: {min}, max: {max}')
+    depth_normalized = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX)
+    depth_uint8 = depth_normalized.astype(np.uint8)
+    cv2.imwrite('{}/depth.png'.format(output_path), depth_uint8)
+
 if __name__ == "__main__":
     # img_path = "3D60/1_color_0_Left_Down_0.0.png"
-    img_path = "3D60/2_color_0_Left_Down_0.0.png"
-    depth_path = img_path.replace("color", "depth").replace(".png", ".exr")
+    # img_path = "3D60/2_color_0_Left_Down_0.0.png"
     CRITICAL_DEPTH = cal_critical_depth(RADIUS, PIXEL)
     CRITICAL_DEPTH = min(CRITICAL_DEPTH, CRITICAL_DEPTH_SET)
-    print('[Stereo Parameters]\nCircular Radius: %sm\nProjection Radius: %sm\nPixel on Equator: %s\nCritical Depth: %sm\n' % (RADIUS, PRO_RADIUS, PIXEL, CRITICAL_DEPTH))
-    
-    exr_data = pyexr.read(depth_path)
-    depth = exr_data[..., 0].copy()
+    print('----- [Stereo Parameters] -----\nCircular Radius: %sm\nProjection Radius: %sm\nPixel on Equator: %s\nCritical Depth: %sm\n===============================' % (RADIUS, PRO_RADIUS, PIXEL, CRITICAL_DEPTH))
+
+    # Depth From GT
+    # depth_path = img_path.replace("color", "depth").replace(".png", ".exr")
+    # exr_data = pyexr.read(depth_path)
+    # depth = exr_data[..., 0].copy()
+
+    # Depth From Estimation
+    img_path = "Lab_data/Lab2_fix.png"
+    depth = depth_estimation(cv2.imread(img_path), max_depth=20)  # max_depth: 20 for indoor model, 80 for outdoor model
+
 
     bgr_array = cv2.imread(img_path, cv2.IMREAD_COLOR)
     if bgr_array is None:
@@ -252,23 +276,26 @@ if __name__ == "__main__":
     rgb_array = cv2.cvtColor(bgr_array, cv2.COLOR_BGR2RGB)
 
     assert rgb_array.shape[:2] == depth.shape[:2]
+    height, width = rgb_array.shape[:2]
 
     left, right = generate_stereo_pair(rgb_array, depth)
     
     left_bgr = cv2.cvtColor(left, cv2.COLOR_RGB2BGR)
     right_bgr = cv2.cvtColor(right, cv2.COLOR_RGB2BGR)
-    os.makedirs("output", exist_ok = True)
-    cv2.imwrite("output/left.png", left_bgr)
-    cv2.imwrite("output/right.png", right_bgr)
 
+    output_dir = make_output_dir()
+    save_depth_map(depth, output_dir)
+    cv2.imwrite("{}/left.png".format(output_dir), left_bgr)
+    cv2.imwrite("{}/right.png".format(output_dir), right_bgr)
+
+    # Repair black regions
     left_repaired = repair_black_regions(left)
     right_repaired = repair_black_regions(right)
-
-    cv2.imwrite("output/left_repaired.png", cv2.cvtColor(left_repaired, cv2.COLOR_RGB2BGR))
-    cv2.imwrite("output/right_repaired.png", cv2.cvtColor(right_repaired, cv2.COLOR_RGB2BGR))
+    cv2.imwrite("{}/left_repaired.png".format(output_dir), cv2.cvtColor(left_repaired, cv2.COLOR_RGB2BGR))
+    cv2.imwrite("{}/right_repaired.png".format(output_dir), cv2.cvtColor(right_repaired, cv2.COLOR_RGB2BGR))
 
     # 获取输出目录绝对路径
-    output_dir = Path("output").absolute()
+    output_dir = Path(output_dir).absolute()
 
     try:
         # 执行立体图像生成
@@ -291,7 +318,8 @@ if __name__ == "__main__":
             "-i", str(output_dir/"left_repaired.png"),
             "-i", str(output_dir/"right_repaired.png"),
             "-filter_complex",
-            "[0:v]scale=512:256[img1];[img1][1:v]hstack",
+            "[0:v]scale={}:{}[img1];[img1][1:v]hstack".format(
+                int(width), int(height)),
             str(output_dir/"stereo.jpg")
         ], check=True)
 
@@ -314,6 +342,7 @@ if __name__ == "__main__":
         print(f"处理出错: {str(e)}")
     else:
         print("立体图像和视频生成完成")
+        print(f"输出目录: {output_dir}")
 
 
 
