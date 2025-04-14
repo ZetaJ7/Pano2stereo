@@ -1,11 +1,9 @@
-import os,sys
 import cv2
 import torch
 import numpy as np
 import logging
 
 from submodule.DepthAnythingv2.metric_depth.depth_anything_v2.dpt import DepthAnythingV2
-# from submodule.DepthAnythingv2.depth_anything_v2.dpt import DepthAnythingV2
 
 def depth_estimation(raw_img, max_depth=20,encoder='vitl', dataset='hypersim'):
     # input : cv2.imread
@@ -35,6 +33,10 @@ def depth_estimation(raw_img, max_depth=20,encoder='vitl', dataset='hypersim'):
     depth = model.infer_image(raw_img) # HxW depth map in meters in numpy
     t2 = cv2.getTickCount()
     logging.info(f'[DepthAnythingV2] Inference time: {(t2 - t1) / cv2.getTickFrequency()} seconds')
+    for i in range(10):
+        depth = model.infer_image(raw_img)
+    t3 = cv2.getTickCount()
+    logging.info(f'[DepthAnythingV2] Inference time: {((t3 - t2)/10)/ cv2.getTickFrequency()} seconds')
 
     return depth
 
