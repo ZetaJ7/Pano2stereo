@@ -10,6 +10,10 @@ from pathlib import Path
 from tqdm import tqdm
 from depth_estimate import depth_estimation
 
+import multiprocessing
+from multiprocessing import Process,Queue
+from multiprocessing.shared_memory import SharedMemory
+
 # def image_coords_to_uv(image_width, image_height):
 #     # 生成网格坐标 (x, y)
 #     x = np.arange(image_width)
@@ -21,6 +25,17 @@ from depth_estimate import depth_estimation
 #     v = (yy / (image_height - 1)) * -2 + 1
     
 #     return np.stack([u, v], axis=-1)  # 返回形状 (H, W, 2)
+
+def logging_setup():
+    file_handler = logging.FileHandler('pano2stereo.log', mode='w')
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+           file_handler,logging.StreamHandler()
+        ]
+    )
+    logging.info("Logging setup complete.")
 
 def cal_critical_depth(r, pixel):
     return r/(math.sin(2*math.pi/pixel))
@@ -38,6 +53,7 @@ def image_coords_to_sphere(image_width, image_height, x=None, y=None):
     返回:
         sphere_coords (array): 球面坐标数组，形状 (H, W, 3) 或单个坐标 (3,)
     """ 
+    t1 = cv2.getTickCount()
     # 生成全图网格或处理单个坐标
     if x is None or y is None:
         x = np.arange(image_width)
@@ -71,6 +87,9 @@ def image_coords_to_sphere(image_width, image_height, x=None, y=None):
     
     # 合并结果
     sphere_coords = np.stack([r, theta, phi], axis=-1)
+    t2 = cv2.getTickCount()
+    time = (t2 - t1) / cv2.getTickFrequency()
+    logging.info(f"Image to sphere coordinates time: {time:.4f} seconds")
     return sphere_coords.squeeze()  # 移除多余维度
 
 def sphere_to_image_coords(sphere_coords, image_width, image_height):
@@ -86,6 +105,7 @@ def sphere_to_image_coords(sphere_coords, image_width, image_height):
     返回:
         image_coords (array): 图像坐标数组，形状为 (..., 2)，数据类型为int32
     """
+    t1 = cv2.getTickCount()
     sphere_coords = np.asarray(sphere_coords)
     r = sphere_coords[..., 0]
     theta = sphere_coords[..., 1]  # 极角 [0, π]
@@ -116,10 +136,13 @@ def sphere_to_image_coords(sphere_coords, image_width, image_height):
         np.clip(x, 0, image_width - 1),
         np.clip(y, 0, image_height - 1)
     ], axis=-1)
-    
+    t2 = cv2.getTickCount()
+    time = (t2 - t1) / cv2.getTickFrequency()
+    logging.info(f"Sphere to image coordinates time: {time:.4f} seconds")
     return image_coords
 
 def sphere2pano(sphere, z, r, critical_depth):
+    t1 = cv2.getTickCount()
     if z >= critical_depth:
         return sphere, sphere
 
@@ -144,7 +167,9 @@ def sphere2pano(sphere, z, r, critical_depth):
 
     sphere_l = np.stack([R, theta_l, phi_l], axis=-1)
     sphere_r = np.stack([R, theta_r, phi_r], axis=-1)
-    
+    t2 = cv2.getTickCount()
+    time = (t2 - t1) / cv2.getTickFrequency()
+    logging.info(f"Sphere to pano time: {time:.4f} seconds")
     return sphere_l, sphere_r
 
 # def clinder2pano(clinder, z, r=RADIUS):
@@ -208,12 +233,13 @@ def make_output_dir(base_dir='results/output'):
 
 def save_depth_map(depth, output_path):
     min,max = depth.min(), depth.max()
-    print(f'Depth min: {min}, max: {max}\n-------------------')
+    logging.info(f'Depth min: {min}, max: {max}')
     depth_normalized = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX)
     depth_uint8 = depth_normalized.astype(np.uint8)
     cv2.imwrite('{}/depth.png'.format(output_path), depth_uint8)
 
 def sphere2pano_vectorized(sphere_coords, z_vals, r, critical_depth):
+    t1 = cv2.getTickCount()
     R = sphere_coords[..., 0]
     theta = sphere_coords[..., 1]
     phi = sphere_coords[..., 2]
@@ -225,13 +251,17 @@ def sphere2pano_vectorized(sphere_coords, z_vals, r, critical_depth):
     phi_l = (phi + delta) % (2 * np.pi)
     phi_r = (phi - delta) % (2 * np.pi)
 
+    t2 = cv2.getTickCount()
+    time = (t2 - t1) / cv2.getTickFrequency()
+    logging.info(f"Sphere to pano vectorized time: {time:.4f} seconds")
     return (
         np.stack([R, theta, phi_l], axis=-1),
         np.stack([R, theta, phi_r], axis=-1)
     )
 
 def generate_stereo_pair_vectorized(rgb_data, depth_data,r, critical_depth):
-    print("======================\nGenerating stereo pair...")
+    # Speed up with multi-threading
+    logging.info("=============== Generating stereo pair(Threading) ================")
     t1 = cv2.getTickCount()
     H, W = rgb_data.shape[:2]
     sphere_coords = image_coords_to_sphere(W, H)
@@ -289,16 +319,141 @@ def generate_stereo_pair_vectorized(rgb_data, depth_data,r, critical_depth):
 
     t2 = cv2.getTickCount()
     time = (t2 - t1) / cv2.getTickFrequency()
-    print(f"Panoramic processing time: {time:.4f} seconds\n======================")
+    logging.info(f"Panoramic processing TOTAL time: {time:.4f} seconds")
     return left, right
+
+def generate_stereo_pair_multiprocess(rgb_data, depth_data, r, critical_depth):
+    # Speed up with multiprocessing
+    logging.info("=============== Generating stereo pair (Multi-process) ===================")
+    t1 = cv2.getTickCount()
+    H, W = rgb_data.shape[:2]
+    
+    # 生成球面坐标（主进程计算）
+    sphere_coords = image_coords_to_sphere(W, H)
+    sphere_l, sphere_r = sphere2pano_vectorized(sphere_coords, depth_data, r, critical_depth)
+    
+    # 转换为图像坐标
+    xl, yl = sphere_to_image_coords(sphere_l, W, H)[..., 0], sphere_to_image_coords(sphere_l, W, H)[..., 1]
+    xr, yr = sphere_to_image_coords(sphere_r, W, H)[..., 0], sphere_to_image_coords(sphere_r, W, H)[..., 1]
+
+    t2 = cv2.getTickCount()
+    time1 = (t2 - t1) / cv2.getTickFrequency()
+    logging.info(f"Coordinates translate TOTAL time: {time1:.4f} seconds")
+    # 创建共享内存
+    shm_rgb = SharedMemory(create=True, size=rgb_data.nbytes)
+    shm_depth = SharedMemory(create=True, size=depth_data.nbytes)
+    shm_left = SharedMemory(create=True, size=rgb_data.nbytes)
+    shm_right = SharedMemory(create=True, size=rgb_data.nbytes)
+    t3 = cv2.getTickCount()
+    time2 = (t3 - t2) / cv2.getTickFrequency()
+    logging.info(f"Shared memory allocation time: {time2:.4f} seconds")
+
+
+    # 将数据复制到共享内存
+    np.copyto(np.ndarray(rgb_data.shape, dtype=rgb_data.dtype, buffer=shm_rgb.buf), rgb_data)
+    np.copyto(np.ndarray(depth_data.shape, dtype=depth_data.dtype, buffer=shm_depth.buf), depth_data)
+    t4 = cv2.getTickCount()
+    time3 = (t4 - t3) / cv2.getTickFrequency()
+    logging.info(f"Data copy to shared memory time: {time3:.4f} seconds")
+
+    # 创建进程间通信队列
+    result_queue = Queue()
+
+    # 启动左眼处理进程
+    p_left = Process(target=process_eye_worker,
+                    args=('left', shm_rgb.name, shm_depth.name, 
+                         shm_left.name, xl, yl, W, H, result_queue))
+    # 启动右眼处理进程
+    p_right = Process(target=process_eye_worker,
+                     args=('right', shm_rgb.name, shm_depth.name,
+                          shm_right.name, xr, yr, W, H, result_queue))
+    t5 = cv2.getTickCount()
+    time4 = (t5 - t4) / cv2.getTickFrequency()
+    logging.info(f"Process creation time: {time4:.4f} seconds")
+    
+    p_left.start()
+    p_right.start()
+    
+    # 等待子进程完成
+    p_left.join()
+    p_right.join()
+    
+    # 重建结果数组
+    left = np.ndarray((H, W, 3), dtype=rgb_data.dtype, buffer=shm_left.buf).copy()
+    right = np.ndarray((H, W, 3), dtype=rgb_data.dtype, buffer=shm_right.buf).copy()
+    t6 = cv2.getTickCount()
+    time5 = (t6 - t5) / cv2.getTickFrequency()
+    logging.info(f"StereoPairs Generation time: {time5:.4f} seconds")
+
+    # 释放共享内存
+    shm_rgb.close()
+    shm_depth.close()
+    shm_left.close()
+    shm_right.close()
+    shm_rgb.unlink()
+    shm_depth.unlink()
+    shm_left.unlink()
+    shm_right.unlink()
+
+    t7 = cv2.getTickCount()
+    time6 = (t7 - t6) / cv2.getTickFrequency()
+    logging.info(f"Memory clear time: {time6:.4f} seconds")
+    return left, right
+
+def process_eye_worker(side, shm_rgb_name, shm_depth_name, 
+                      shm_output_name, x_dest, y_dest, W, H, queue):
+    """工作进程处理单侧投影"""
+    try:
+        # 连接到共享内存
+        shm_rgb = SharedMemory(name=shm_rgb_name)
+        shm_depth = SharedMemory(name=shm_depth_name)
+        shm_output = SharedMemory(name=shm_output_name)
+        
+        # 重建numpy数组视图
+        rgb = np.ndarray((H, W, 3), dtype=np.uint8, buffer=shm_rgb.buf)
+        depth = np.ndarray((H, W), dtype=np.float32, buffer=shm_depth.buf)
+        output = np.ndarray((H, W, 3), dtype=np.uint8, buffer=shm_output.buf)
+        z_buffer = np.full((H, W), np.inf)
+        
+        # 处理逻辑
+        valid = (x_dest >= 0) & (x_dest < W) & (y_dest >= 0) & (y_dest < H)
+        dest_indices = y_dest[valid] * W + x_dest[valid]
+        source_idx = np.where(valid)
+        z_values = depth[source_idx]
+        
+        sorted_idx = np.argsort(z_values)
+        _, unique_idx = np.unique(dest_indices[sorted_idx], return_index=True)
+        selected = sorted_idx[unique_idx]
+        
+        src_y = source_idx[0][selected]
+        src_x = source_idx[1][selected]
+        dest_y = y_dest[valid][selected]
+        dest_x = x_dest[valid][selected]
+        
+        output[dest_y, dest_x] = rgb[src_y, src_x]
+        queue.put(f"{side} process completed")
+        
+    finally:
+        # 关闭共享内存连接
+        shm_rgb.close()
+        shm_depth.close()
+        shm_output.close()
+
+
+def generate_stereo_pair(rgb_array, depth, r, critical_depth, method=0):
+    if method == 0:     # Multi-threading
+        return generate_stereo_pair_vectorized(rgb_array, depth, r, critical_depth)
+    elif method == 1:   # Multi-processing
+        return generate_stereo_pair_multiprocess(rgb_array, depth, r, critical_depth)
 
 def main():
     # img_path = "3D60/1_color_0_Left_Down_0.0.png"
     # img_path = "3D60/2_color_0_Left_Down_0.0.png"
-    img_path = "Lab_data/Lab1.png"
+    img_path = "Lab_data/Lab1_360P.png"
     # img_path = "Lab_data/Lab2.jpg"
     if not os.path.exists(img_path):
         raise FileNotFoundError(f"无法读取图像文件: {img_path}")
+    logging.info(f"Input Image: {img_path}")
     
     RADIUS = 0.032                  # 视环半径(m) 
     PRO_RADIUS = 1                  # 视环投影半径(m) 
@@ -308,7 +463,7 @@ def main():
 
     CRITICAL_DEPTH_CAL = cal_critical_depth(RADIUS, PIXEL)
     CRITICAL_DEPTH = min(CRITICAL_DEPTH, CRITICAL_DEPTH_CAL)
-    print('----- [Stereo Parameters] -----\nCircular Radius: %sm\nProjection Radius: %sm\nPixel on Equator: %s\nCritical Depth: %sm\n===============================' % (RADIUS, PRO_RADIUS, PIXEL, CRITICAL_DEPTH))
+    logging.info('[Stereo Parameters]\nCircular Radius: %sm\nProjection Radius: %sm\nPixel on Equator: %s\nCritical Depth: %sm\n===============================' % (RADIUS, PRO_RADIUS, PIXEL, CRITICAL_DEPTH))
 
     # Depth From GT
     # depth_path = img_path.replace("color", "depth").replace(".png", ".exr")
@@ -316,7 +471,10 @@ def main():
     # depth = exr_data[..., 0].copy()
 
     # Depth From Estimation
-    depth = depth_estimation(cv2.imread(img_path), max_depth=20)  # max_depth: 20 for indoor model, 80 for outdoor model
+    # max_depth: 20 for indoor model, 80 for outdoor model
+    # encoder: 'vits', 'vitb', 'vitl' for small/base/large model
+    # dataset: 'hypersim' for indoor model, 'vkitti' for outdoor model
+    depth = depth_estimation(cv2.imread(img_path), max_depth=20, encoder='vitb', dataset='hypersim')  
 
 
     bgr_array = cv2.imread(img_path, cv2.IMREAD_COLOR)
@@ -326,8 +484,9 @@ def main():
 
     assert rgb_array.shape[:2] == depth.shape[:2]
     height, width = rgb_array.shape[:2]
+    logging.info(f"Image Size: {width}x{height}")
 
-    left,right = generate_stereo_pair_vectorized(rgb_array, depth, r=RADIUS, critical_depth=CRITICAL_DEPTH)
+    left,right = generate_stereo_pair(rgb_array, depth, r=RADIUS, critical_depth=CRITICAL_DEPTH,method=0)
     
     left_bgr = cv2.cvtColor(left, cv2.COLOR_RGB2BGR)
     right_bgr = cv2.cvtColor(right, cv2.COLOR_RGB2BGR)
@@ -375,6 +534,7 @@ def main():
 
         if GENERATE_VIDEO:      
             # 生成循环视频
+            logging.info("Generating video...")
             subprocess.run([
                 "ffmpeg",
                 "-y",
@@ -388,15 +548,16 @@ def main():
             ], check=True)
 
     except subprocess.CalledProcessError as e:
-        print(f"命令执行失败: {e.returncode}\n{e.stderr}")
+        logging.info(f"Failure: {e.returncode}\n{e.stderr}")
     except Exception as e:
-        print(f"处理出错: {str(e)}")
+        logging.info(f"Error: {str(e)}")
     else:
-        print("立体图像和视频生成完成")
+        logging.info("Panoramic to Stereo conversion completed successfully.")
         
-    print(f"输出目录: {output_dir}")
+    logging.info(f"Output Dir: {output_dir}")
 
 if __name__ == "__main__":
+    logging_setup()
     main()
 
 
