@@ -1,3 +1,4 @@
 results/*
 *.pth
 *.log
+Lab_data/snapshots

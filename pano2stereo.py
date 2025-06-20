@@ -395,15 +395,14 @@ class StereoPano():
 def main():
     # ============= 1. Load Image ================
     # img_path = "3D60/1_color_0_Left_Down_0.0.png"
-    # img_path = "3D60/2_color_0_Left_Down_0.0.png"
-    img_path = "Lab_data/Lab1_360P.png"
-    # img_path = "Lab_data/Lab2.jpg"
+    # img_path = "Lab_data/Lab1_360P.png"
+    img_path = "Lab_data/Lab3.jpg"
     if not os.path.exists(img_path):
-        raise FileNotFoundError(f"无法读取图像文件: {img_path}")
+        raise FileNotFoundError(f"File Not Found: {img_path}")   
     logging.info(f"Icput Image: {img_path}")
     bgr_array = cv2.imread(img_path, cv2.IMREAD_COLOR)
     if bgr_array is None:
-        raise FileNotFoundError(f"无法读取图像文件: {img_path}")
+        raise FileNotFoundError(f"Cannot Read file: {img_path}")
     rgb_array = cv2.cvtColor(bgr_array, cv2.COLOR_BGR2RGB)
     height, width = rgb_array.shape[:2]
     logging.info(f"Image Size: {width}x{height}")
