@@ -1,3 +1,6 @@
 [submodule "submodule/DepthAnythingv2"]
 	path = submodule/DepthAnythingv2
 	url = git@github.com:DepthAnything/Depth-Anything-V2.git
+[submodule "submodule/Flashdepth"]
+	path = submodule/Flashdepth
+	url = git@github.com:Eyeline-Research/FlashDepth.git
