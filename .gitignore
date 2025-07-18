@@ -1,5 +1,7 @@
 results/*
 *.pth
 *.log
-Lab_data/snapshots
-avatii/ 
+Data/snapshots/
+Data/avatii/
+Data/AvatarVision/
+Data/3D60
