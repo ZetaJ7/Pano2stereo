@@ -218,69 +218,70 @@ class OptimizedStereoPano():
         
         return cp.stack([r, theta, phi], axis=-1)
 
-    def sphere_to_image_coords_optimized(self, sphere_coords):
-        """优化的球面到图像坐标转换"""
-        r = sphere_coords[..., 0]
-        theta = sphere_coords[..., 1]
-        phi = sphere_coords[..., 2]
-        
-        # 优化：避免重复计算
-        theta = cp.clip(theta, 0, cp.pi)
-        phi = (phi + cp.pi) % (2 * cp.pi) - cp.pi
-        
-        lat = cp.pi / 2 - theta
-        lon = phi
-        u = lon / cp.pi
-        v = lat / (cp.pi / 2)
-        
-        # 直接计算最终坐标
-        x = cp.round((u + 1) * 0.5 * (self.width - 1)).astype(cp.int32)
-        y = cp.round((1 - v) * 0.5 * (self.height - 1)).astype(cp.int32)
-        
-        # 边界裁剪
-        x = cp.clip(x, 0, self.width - 1)
-        y = cp.clip(y, 0, self.height - 1)
-        
-        return cp.stack([x, y], axis=-1)
+    def sphere_to_image_coords(self, sphere_coords, image_width, image_height):
+        """原版本的球面到图像坐标转换（更高效）"""
+        with profiler.timer("Sphere_to_image_coords"):
+            sphere_coords = cp.asarray(sphere_coords)
+            r = sphere_coords[..., 0]
+            theta = sphere_coords[..., 1]
+            phi = sphere_coords[..., 2]
+            theta = cp.clip(theta, 0, cp.pi)
+            phi = (phi + cp.pi) % (2 * cp.pi) - cp.pi
+            lat = cp.pi / 2 - theta
+            lon = phi
+            u = lon / cp.pi
+            v = lat / (cp.pi / 2)
+            x_float = (u + 1) * 0.5 * (image_width - 1)
+            y_float = (1 - v) * 0.5 * (image_height - 1)
+            x = cp.round(x_float).astype(cp.int32)
+            y = cp.round(y_float).astype(cp.int32)
+            image_coords = cp.stack([
+                cp.clip(x, 0, image_width - 1),
+                cp.clip(y, 0, image_height - 1)
+            ], axis=-1)
+            return image_coords
 
-    def generate_stereo_pair_optimized(self, rgb_data, depth_data):
-        """优化的立体对生成"""
-        logging.info("=============== Generating stereo pair (Optimized) ================")
-        
-        # 快速视差计算
-        mask = depth_data < self.critical_depth
-        # 使用安全除法避免inf
-        safe_depth = cp.where(mask, depth_data, 1e6)
-        ratio = cp.clip(self.IPD / safe_depth, -1.0, 1.0)
-        delta = cp.arcsin(ratio)
-        
-        # 获取phi角度
-        phi = self.sphere_coords[..., 2]
-        phi_l = (phi + delta) % (2 * cp.pi)
-        phi_r = (phi - delta) % (2 * cp.pi)
-        
-        # 构建左右眼球面坐标
-        sphere_l = cp.copy(self.sphere_coords)
-        sphere_r = cp.copy(self.sphere_coords)
-        sphere_l[..., 2] = phi_l
-        sphere_r[..., 2] = phi_r
-        
-        # 坐标映射
-        coords_l = self.sphere_to_image_coords_optimized(sphere_l)
-        coords_r = self.sphere_to_image_coords_optimized(sphere_r)
-        
-        # 高效的图像采样
-        left = cp.zeros_like(rgb_data)
-        right = cp.zeros_like(rgb_data)
-        
-        # 使用高级索引进行快速采样
-        yl, xl = coords_l[..., 1], coords_l[..., 0]
-        yr, xr = coords_r[..., 1], coords_r[..., 0]
-        
-        left[self.grid_y, self.grid_x, :] = rgb_data[yl, xl, :]
-        right[self.grid_y, self.grid_x, :] = rgb_data[yr, xr, :]
-        
-        return left, right
+    def sphere2pano_vectorized(self, sphere_coords, z_vals):
+        """原版本的高效球面视差计算"""
+        with profiler.timer("Sphere2pano_vectorized"):
+            R = cp.asarray(sphere_coords[..., 0])
+            theta = cp.asarray(sphere_coords[..., 1])
+            phi = cp.asarray(sphere_coords[..., 2])
+            mask = z_vals < self.critical_depth
+            ratio = cp.clip(self.IPD / cp.where(mask, z_vals, cp.inf), -1.0, 1.0)
+            delta = cp.arcsin(ratio)
+            phi_l = (phi + delta) % (2 * cp.pi)
+            phi_r = (phi - delta) % (2 * cp.pi)
+            return (
+                cp.stack([R, theta, phi_l], axis=-1),
+                cp.stack([R, theta, phi_r], axis=-1)
+            )
+
+    def generate_stereo_pair_vectorized(self, rgb_data, depth_data):
+        """原版本的高效立体对生成"""
+        with profiler.timer("Generate_stereo_pair_total"):
+            logging.info("=============== Generating stereo pair (Original Method) ================")
+            
+            with profiler.timer("Sphere2pano_calculation"):
+                sphere_l, sphere_r = self.sphere2pano_vectorized(self.sphere_coords, depth_data)
+            
+            with profiler.timer("Coordinate_mapping"):
+                coords_l = self.sphere_to_image_coords(sphere_l, self.width, self.height)
+                coords_r = self.sphere_to_image_coords(sphere_r, self.width, self.height)
+            
+            with profiler.timer("Image_sampling"):
+                xl, yl = coords_l[..., 0], coords_l[..., 1]
+                xr, yr = coords_r[..., 0], coords_r[..., 1]
+                left = cp.zeros_like(rgb_data)
+                right = cp.zeros_like(rgb_data)
+                left[cp.arange(self.height)[:, None], cp.arange(self.width), :] = rgb_data[yl, xl, :]
+                right[cp.arange(self.height)[:, None], cp.arange(self.width), :] = rgb_data[yr, xr, :]
+            
+            return left, right
+
+    def generate_stereo_pair(self, rgb_array, depth):
+        """统一的立体对生成入口"""
+        return self.generate_stereo_pair_vectorized(rgb_array, depth)
 
     def repair_black_regions_fast(self, image):
         """快速黑色区域修复（可选）"""
@@ -514,9 +515,9 @@ def main_optimized():
             depth_gpu = cp.asarray(depth, dtype=cp.float32)
             d_rgb = cp.asarray(rgb_array, dtype=cp.float32)
         
-        # 4. 🎯 立体对生成（核心计时）
+        # 4. 🎯 立体对生成（核心计时 - 使用原版本方法）
         with profiler.timer("🎯 Stereo_pair_generation"):
-            left, right = generator.generate_stereo_pair_optimized(d_rgb, depth_gpu)
+            left, right = generator.generate_stereo_pair_vectorized(d_rgb, depth_gpu)
         
         # 5. 🔧 图像修复（核心计时 - 并行处理）
         with profiler.timer("🔧 Image_repair"):
