@@ -1,0 +1,35 @@
+# ================== Pano2Stereo 配置文件 ==================
+# 这个文件包含了程序的所有可配置参数
+# 修改这里的参数来调整程序行为
+URL: "rtsp://10.20.35.30:28552/test"
+
+# ============== 基础立体视觉参数 ==============
+ipd: 0.032                         # 瞳距 (米) - 人眼间距，影响立体效果强度
+pro_radius: 1                      # 视环投影半径 (米)
+pixel: 4448                        # 赤道图像宽度 (像素)
+critical_depth: 9999               # 临界深度 (米) - 超过此距离视为无穷远
+
+# ============== 输入输出设置 ==============
+img_path: "Data/Lab3.jpg"          # 输入图片路径
+output_base: "output/stream"      # 输出目录基础名
+generate_video: false              # 是否生成视频文件
+
+# ============== 深度估计模型设置 ==============
+vit_size: "vits"                   # 深度模型类型: "vits"(最快), "vitb"(中等), "vitl"(最慢但最准确)
+dataset: "hypersim"                # 深度模型数据集: "hypersim" 或 "vkitti"
+
+# ============== 性能优化设置 ==============
+target_height: 540                 # 目标图像高度 (像素) - 降低以提升速度
+target_width: 960                  # 目标图像宽度 (像素) - 降低以提升速度
+
+# ============== 功能开关 ==============
+enable_repair: true                # 是否启用黑色区域修复
+enable_post_process: true          # 是否启用后处理
+enable_red_cyan: false             # 是否生成红青3D图 (关闭可提升约0.4秒速度)
+
+# ============== FlashDepth 配置 ==============
+flashdepth:
+  config_path: "configs/flashdepth.yaml"
+  stream_mode: true
+  save_depth_png: false
+  max_frames: null

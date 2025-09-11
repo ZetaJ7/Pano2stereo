@@ -9,30 +9,123 @@ import logging
 import subprocess
 from pathlib import Path
 from tqdm import tqdm
-from depth_estimate import depth_estimation
-from submodule.DepthAnythingv2.metric_depth.depth_anything_v2.dpt import DepthAnythingV2
-from numba import cuda
+from submodule.Flashdepth.inference import FlashDepthProcessor
 import cupy as cp
 from contextlib import contextmanager
+import gc
+import concurrent.futures  
 
-# ================== 参数集中管理 ==================
-PARAMS = {
-    "IPD": 0.032,                      # 视环半径(m)
-    "PRO_RADIUS": 1,                   # 视环投影半径(m)
-    "PIXEL": 4448,                     # 赤道图像宽度(pixel)
-    "CRITICAL_DEPTH": 9999,            # 临界深度(m)
-    "GENERATE_VIDEO": 0,               # 是否生成视频
-    "IMG_PATH": "Data/Lab3.jpg",       # 输入图片路径
-    "VIT_SIZE": "vits",                # 深度模型类型
-    "DATASET": "hypersim",             # 深度模型数据集
-    "OUTPUT_BASE": "results/output"    # 输出目录基础名
-}
+def cal_critical_depth(r, pixel):
+    return r / (math.sin(2 * math.pi / pixel))
 
-# ================== 性能监控 ==================
+def torch_to_cupy(tensor1, tensor2):
+    """Convert two torch tensors to CuPy arrays"""
+    # Assert that inputs are torch tensors
+    assert isinstance(tensor1, torch.Tensor), f"tensor1 must be a torch.Tensor, got {type(tensor1)}"
+    assert isinstance(tensor2, torch.Tensor), f"tensor2 must be a torch.Tensor, got {type(tensor2)}"
+    tensor1 = tensor1.float()
+    tensor2 = tensor2.float()
+
+    # Convert first tensor (RGB data) - keep as 3D (H, W, C)
+    if tensor1.is_cuda:
+        tensor1_cupy = cp.asarray(tensor1)
+    else:
+        tensor1_cupy = cp.asarray(tensor1.numpy())
+    
+    # Convert second tensor (depth data) - ensure it's 2D (H, W)
+    if tensor2.is_cuda:
+        tensor2_cupy = cp.asarray(tensor2)
+    else:
+        tensor2_cupy = cp.asarray(tensor2.numpy())
+
+    # BGR change to RGB
+    tensor2_cupy = tensor2_cupy[:, :, [2, 1, 0]]
+    
+    return tensor1_cupy, tensor2_cupy
+
+# Load parameters from YAML config file
+def load_config(file):
+    """Load parameters from YAML config file"""
+    config_file_yaml = file
+    
+    # Load YAML configuration
+    if os.path.exists(config_file_yaml):
+        try:
+            import yaml
+            with open(config_file_yaml, 'r', encoding='utf-8') as f:
+                yaml_config = yaml.safe_load(f)
+            
+            # Convert YAML parameters to code format
+            params = {
+                "URL": yaml_config.get("URL", None), 
+                "IPD": yaml_config.get("ipd", 0.032),
+                "PRO_RADIUS": yaml_config.get("pro_radius", 1),
+                "PIXEL": yaml_config.get("pixel", 4448),
+                "CRITICAL_DEPTH": yaml_config.get("critical_depth", 9999),
+                "GENERATE_VIDEO": yaml_config.get("generate_video", False),
+                "IMG_PATH": yaml_config.get("img_path", "Data/Lab1_2k.png"),
+                "VIT_SIZE": yaml_config.get("vit_size", "vits"),
+                "DATASET": yaml_config.get("dataset", "hypersim"),
+                "OUTPUT_BASE": yaml_config.get("output_base", "results/output"),
+                "ENABLE_REPAIR": yaml_config.get("enable_repair", True),
+                "ENABLE_POST_PROCESS": yaml_config.get("enable_post_process", True),
+                "ENABLE_RED_CYAN": yaml_config.get("enable_red_cyan", False),
+                "TARGET_HEIGHT": yaml_config.get("target_height", 540),
+                "TARGET_WIDTH": yaml_config.get("target_width", 960),
+                # FlashDepth related configuration
+                "FLASHDEPTH_CONFIG": yaml_config.get("flashdepth", {})
+            }
+            logging.info("Configuration loaded from config.yaml")
+            return params
+            
+        except ImportError:
+            logging.error("PyYAML not installed. Please install PyYAML: pip install PyYAML")
+            raise
+        except Exception as e:
+            logging.error(f"Failed to load YAML config: {e}")
+            raise
+    
+    # If YAML file does not exist, use default parameters
+    logging.warning("yaml not found, using default parameters")
+    return {
+        "URL": None,  # Default URL
+        "IPD": 0.032,                      # Pupil distance (m)
+        "PRO_RADIUS": 1,                   # Projection radius (m)
+        "PIXEL": 4448,                     # Equatorial image width (pixel)
+        "CRITICAL_DEPTH": 9999,            # Critical depth (m)
+        "GENERATE_VIDEO": False,           # Whether to generate video
+        "IMG_PATH": "Data/Lab1_2k.png",    # Input image path
+        "VIT_SIZE": "vits",                # Depth model type
+        "DATASET": "hypersim",             # Depth model dataset
+        "OUTPUT_BASE": "results/output",   # Output directory base name
+        "ENABLE_REPAIR": True,             # Whether to enable image repair
+        "ENABLE_POST_PROCESS": True,       # Whether to enable post-processing
+        "ENABLE_RED_CYAN": False,          # Whether to generate red-cyan 3D image
+        "TARGET_HEIGHT": 540,              # Target height
+        "TARGET_WIDTH": 960,               # Target width
+        "FLASHDEPTH_CONFIG": {}
+    }
+
+# Load configuration parameters
+PARAMS = load_config('configs/pano.yaml')
+logging.info(f"Loaded parameters: {PARAMS}")
+
+# ================== Performance Monitoring ==================
 class PerformanceProfiler:
     def __init__(self):
         self.timings = {}
         self.active_timers = {}
+    
+    def reset(self):
+        """Reset timer data"""
+        self.timings.clear()
+        self.active_timers.clear()
+    
+    def get_timing(self, name):
+        """Get the latest time for the specified timer"""
+        if name in self.timings and self.timings[name]:
+            return self.timings[name][-1]  # Return the latest time
+        return None
     
     @contextmanager
     def timer(self, name):
@@ -45,7 +138,13 @@ class PerformanceProfiler:
             if name not in self.timings:
                 self.timings[name] = []
             self.timings[name].append(elapsed)
-            logging.info(f"[TIMER] {name}: {elapsed:.4f}s")
+            
+            # Output immediately and flush log
+            message = f"[TIMER] {name}: {elapsed:.4f}s"
+            logging.info(message)
+            # Force flush all handlers
+            for handler in logging.getLogger().handlers:
+                handler.flush()
     
     def get_summary(self):
         summary = "\n" + "="*50 + "\n[TIMER] Performance Summary:\n" + "="*50
@@ -66,81 +165,234 @@ class PerformanceProfiler:
         summary += f"\n{'='*50}"
         return summary
 
-# 全局性能分析器
+# Global performance profiler
 profiler = PerformanceProfiler()
 
-model_configs = {
-    'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
-    'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
-    'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
-}
-
 def logging_setup():
-    file_handler = logging.FileHandler('logs/pano2stereo.log', mode='w')
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            file_handler, logging.StreamHandler()
-        ]
-    )
-    logging.info("Logging setup complete.")
+    # Set OpenCV log level to reduce warnings
+    try:
+        cv2.setLogLevel(3)  # 3=ERROR level, reduce warning messages
+    except:
+        pass  # Skip if setting fails
+    
+    # Ensure logs directory exists
+    os.makedirs('logs', exist_ok=True)
+    
+    # Configure logging - force flush buffer
+    file_handler = logging.FileHandler('logs/pano2stereo.log', mode='w', encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+    
+    # Get root logger and configure
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.handlers.clear()  # Clear existing handlers
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
+    
+    # Force flush
+    logging.info("=== Pano2Stereo Optimized Processing Started ===")
+    for handler in root_logger.handlers:
+        handler.flush()
 
-def cal_critical_depth(r, pixel):
-    return r / (math.sin(2 * math.pi / pixel))
+def get_stream_resolution(url):
+    """Get resolution from video stream"""
+    try:
+        cap = cv2.VideoCapture(url)
+        if not cap.isOpened():
+            raise ValueError(f"Cannot open video stream: {url}")
+        
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        
+        cap.release()
+        
+        logging.info(f"Stream resolution: {width}x{height}, FPS: {fps}")
+        return width, height, fps
+    except Exception as e:
+        logging.error(f"Failed to get stream resolution: {e}")
+        raise
 
-class StereoPano():
-    def __init__(self, height, width, IPD, pro_radius, pixel, critical_depth, vit_size='vits', dataset='hypersim'):
-        logging.info('Initializing StereoPano Generator')
-        with profiler.timer("StereoPano_init"):
-            self.IPD = IPD
-            self.width = width
-            self.height = height
-            self.pro_radius = pro_radius
-            self.pixel = pixel
-            self.critical_depth = critical_depth
-            self.device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
-            
-            with profiler.timer("Model_loading"):
-                self.model = DepthAnythingV2(**{**model_configs[vit_size], 'max_depth': 20})
-                self.model.load_state_dict(torch.load(f'checkpoints/depth_anything_v2_metric_{dataset}_{vit_size}.pth', map_location=self.device))
-                self.model = self.model.to(self.device).eval()
-            
-            with profiler.timer("Sphere_coords_precompute"):
-                self.sphere_coords = self.image_coords_to_sphere(width, height)
-            
-            # 激活模型
-            with profiler.timer("Model_warmup"):
-                random = np.array(np.random.rand(1, 3, height, width), dtype=np.float32)
-                self.model.infer_image(random)
-            
-            logging.info('[DepthAnythingV2] Model loaded: {}-{}'.format(vit_size, dataset))
+class Pano2stereo():
+    def __init__(self, IPD, pro_radius, pixel, critical_depth, url):
+        logging.info('Initializing Pano2stereo Generator...')
+        self.IPD = IPD
+        self.width = None
+        self.height = None
+        self.pro_radius = pro_radius
+        self.pixel = pixel
+        self.critical_depth = critical_depth
+        self.device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+        self.outputdir = self.make_output_dir()
+        self.url = url
+        self.target_url = 'rtsp://10.20.35.30:28552/result'
+        self.running = True
+        self.save_result = False
+        
+        # Initialize RTSP streaming
+        self.stream_process = None
+        self.stream_fps = 30  # Default FPS for streaming
+        # Note: RTSP streaming will be initialized after getting dimensions from FlashDepth
+        
+        # Load model
+        logging.info("Initializing FlashDepth model...")
+        self.flashdepth_processor = FlashDepthProcessor(config_path="configs/flashdepth.yaml", url=self.url, stream_mode=True, save_depth_png=False, save_frame=False, max_frames=None) 
+        logging.info('[FlashDepth] Model loaded')
+        
+        # Start FlashDepth inference in a separate thread
+        self.inference_thread = threading.Thread(target=self.flashdepth_processor.run_inference, daemon=True)
+        self.inference_thread.start()
+        logging.info('[FlashDepth] Inference thread started in Pano2stereo.__init__')
+        
+        # Catch width and height from FlashdepthProcessor
+        logging.info("Waiting for FlashDepth inference to start...")
+        # Wait for FlashDepth processor to initialize pred
+        while self.flashdepth_processor.pred is None:
+            time.sleep(0.02)  # Wait 20ms for inference to start
+                
+        # self.pred = [depth_pred, original_frame]  # Store latest depth map & frame（Tensor, shape [H, W, C] in BGR)
+        self.height = self.flashdepth_processor.pred[0].shape[0]
+        self.width = self.flashdepth_processor.pred[0].shape[1]
+        logging.info(f"Got Input resolution from FlashDepth: {self.width}x{self.height}")
+        
+        # Now initialize RTSP streaming with correct dimensions
+        self._init_streaming()
+        
+        # Optimize: Precompute all required coordinate transformations
+        logging.info("Precomputing sphere coordinates...")
+        self.sphere_coords = self._precompute_sphere_coords(self.width, self.height)
+        # Precompute grid coordinates for fast sampling
+        self.grid_y, self.grid_x = cp.meshgrid(cp.arange(self.height), cp.arange(self.width), indexing='ij')
+        
+        logging.info('[Pano2stereo] Initialization completed')
 
-    def image_coords_to_sphere(self, image_width, image_height, x=None, y=None):
-        with profiler.timer("Image_to_sphere_coords"):
-            if x is None or y is None:
-                x = cp.arange(image_width)
-                y = cp.arange(image_height)
-                xx, yy = cp.meshgrid(x, y)
-            else:
-                xx, yy = cp.array(x), cp.array(y)
-            u = (xx / (image_width - 1)) * 2 - 1
-            v = (yy / (image_height - 1)) * -2 + 1
-            lon = u * cp.pi
-            lat = v * (cp.pi / 2)
-            x_xyz = cp.cos(lat) * cp.cos(lon)
-            y_xyz = cp.cos(lat) * cp.sin(lon)
-            z_xyz = cp.sin(lat)
-            r = cp.sqrt(x_xyz ** 2 + y_xyz ** 2 + z_xyz ** 2)
-            safe_r = cp.where(r == 0, 1e-12, r)
-            theta = cp.arccos(z_xyz / safe_r)
-            phi = cp.arctan2(y_xyz, x_xyz)
-            theta = cp.where(r == 0, 0.0, theta)
-            phi = cp.where(r == 0, 0.0, phi)
-            sphere_coords = cp.stack([r, theta, phi], axis=-1)
-            return sphere_coords.squeeze()
+
+
+    def _init_streaming(self):
+        """Initialize RTSP streaming pipeline"""
+        try:
+            # Calculate output resolution (left + right images side by side)
+            output_width = self.width * 2
+            output_height = self.height
+            
+            # ffmpeg command for RTSP streaming
+            ffmpeg_cmd = [
+                'ffmpeg',
+                '-y',  # Overwrite output files
+                '-f', 'rawvideo',
+                '-vcodec', 'rawvideo',
+                '-s', f'{output_width}x{output_height}',  # Frame size
+                '-pix_fmt', 'rgb24',
+                '-r', str(self.stream_fps),  # Frame rate
+                '-i', '-',  # Input from stdin
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-tune', 'zerolatency',
+                '-g', '30',  # GOP size
+                '-f', 'rtsp',
+                '-rtsp_transport', 'tcp',
+                self.target_url
+            ]
+            
+            logging.info(f"Initializing RTSP stream to {self.target_url}")
+            logging.info(f"Stream resolution: {output_width}x{output_height} @ {self.stream_fps}fps")
+            
+            # Start ffmpeg process
+            self.stream_process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            
+            logging.info("RTSP streaming initialized successfully")
+            
+        except Exception as e:
+            logging.error(f"Failed to initialize RTSP streaming: {e}")
+            self.stream_process = None
+
+    def stream_frame(self, frame):
+        """Stream a frame to RTSP"""
+        if self.stream_process and self.stream_process.poll() is None:
+            try:
+                # Ensure frame is in correct format (RGB, uint8)
+                if isinstance(frame, cp.ndarray):
+                    frame = cp.asnumpy(frame)
+                if frame.dtype != np.uint8:
+                    frame = frame.astype(np.uint8)
+                
+                # Write frame to ffmpeg stdin
+                self.stream_process.stdin.write(frame.tobytes())
+                self.stream_process.stdin.flush()
+                
+            except Exception as e:
+                logging.error(f"Failed to stream frame: {e}")
+                # Try to restart streaming
+                self._restart_streaming()
+        else:
+            logging.warning("Stream process not available, attempting to restart...")
+            self._restart_streaming()
+
+    def _restart_streaming(self):
+        """Restart RTSP streaming"""
+        if self.stream_process:
+            try:
+                self.stream_process.terminate()
+                self.stream_process.wait(timeout=5)
+            except:
+                self.stream_process.kill()
+        
+        self._init_streaming()
+
+    def stop_streaming(self):
+        """Stop RTSP streaming"""
+        if self.stream_process:
+            try:
+                self.stream_process.stdin.close()
+                self.stream_process.terminate()
+                self.stream_process.wait(timeout=5)
+                logging.info("RTSP streaming stopped")
+            except Exception as e:
+                logging.error(f"Error stopping stream: {e}")
+                try:
+                    self.stream_process.kill()
+                except:
+                    pass
+
+    def _precompute_sphere_coords(self, image_width, image_height):
+        """Optimized spherical coordinate precomputation"""
+        # Use more efficient coordinate generation
+        x = cp.linspace(0, image_width - 1, image_width, dtype=cp.float32)
+        y = cp.linspace(0, image_height - 1, image_height, dtype=cp.float32)
+        xx, yy = cp.meshgrid(x, y)
+        
+        # Vectorized calculation
+        u = (xx / (image_width - 1)) * 2 - 1
+        v = (yy / (image_height - 1)) * -2 + 1
+        lon = u * cp.pi
+        lat = v * (cp.pi / 2)
+        
+        # Spherical coordinates calculation
+        x_xyz = cp.cos(lat) * cp.cos(lon)
+        y_xyz = cp.cos(lat) * cp.sin(lon)
+        z_xyz = cp.sin(lat)
+        
+        # Use more stable calculation
+        r = cp.ones_like(x_xyz)  # Unit sphere, r=1
+        theta = cp.arccos(cp.clip(z_xyz, -1, 1))
+        phi = cp.arctan2(y_xyz, x_xyz)
+        
+        return cp.stack([r, theta, phi], axis=-1)
 
     def sphere_to_image_coords(self, sphere_coords, image_width, image_height):
+        """Original version of spherical to image coordinate conversion (more efficient)"""
         with profiler.timer("Sphere_to_image_coords"):
             sphere_coords = cp.asarray(sphere_coords)
             r = sphere_coords[..., 0]
@@ -162,45 +414,13 @@ class StereoPano():
             ], axis=-1)
             return image_coords
 
-    def normalize_channel(self, data, percentile=99):
-        data = cp.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
-        max_val = cp.percentile(data, percentile)
-        min_val = cp.percentile(data, 100 - percentile)
-        data = cp.clip(data, min_val, max_val)
-        normalized = (data - min_val) / (max_val - min_val + 1e-8)
-        return normalized
-
-    def repair_black_regions(self, image):
-        with profiler.timer("Repair_black_regions"):
-            image = cp.asnumpy(image).astype(np.uint8)
-            img_bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-            gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            mask = np.uint8(gray == 0) * 255
-            repaired = cv2.inpaint(img_bgr, mask, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
-            return cv2.cvtColor(repaired, cv2.COLOR_BGR2RGB)
-
-    def make_output_dir(self, base_dir=None):
-        if base_dir is None:
-            base_dir = PARAMS["OUTPUT_BASE"]
-        index = 0
-        while True:
-            target_dir = f"{base_dir}_{index:03d}" if index >= 0 else base_dir
-            if not os.path.exists(target_dir):
-                os.makedirs(target_dir)
-                break
-            index += 1
-        return target_dir
-
-    def save_depth_map(self, depth, output_path):
-        depth = depth.get()
-        min_val, max_val = depth.min(), depth.max()
-        logging.info(f'Depth min: {min_val}, max: {max_val}')
-        depth_normalized = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX)
-        depth_uint8 = depth_normalized.astype(np.uint8)
-        cv2.imwrite(str(Path(output_path) / 'depth.png'), depth_uint8)
-
     def sphere2pano_vectorized(self, sphere_coords, z_vals):
+        """Original version of efficient spherical parallax calculation"""
         with profiler.timer("Sphere2pano_vectorized"):
+            # Ensure z_vals is 2D
+            z_vals = cp.asarray(z_vals)
+            assert z_vals.ndim == 2, "z_vals must be 2D, got shape"
+            
             R = cp.asarray(sphere_coords[..., 0])
             theta = cp.asarray(sphere_coords[..., 1])
             phi = cp.asarray(sphere_coords[..., 2])
@@ -215,8 +435,9 @@ class StereoPano():
             )
 
     def generate_stereo_pair_vectorized(self, rgb_data, depth_data):
+        """Original version of efficient stereo pair generation"""
         with profiler.timer("Generate_stereo_pair_total"):
-            logging.info("=============== Generating stereo pair ================")
+            logging.info("=============== Generating stereo pair (Original Method) ================")
             
             with profiler.timer("Sphere2pano_calculation"):
                 sphere_l, sphere_r = self.sphere2pano_vectorized(self.sphere_coords, depth_data)
@@ -236,155 +457,364 @@ class StereoPano():
             return left, right
 
     def generate_stereo_pair(self, rgb_array, depth):
+        """Unified stereo pair generation entry"""
         return self.generate_stereo_pair_vectorized(rgb_array, depth)
 
-# =============== 功能函数 ===============
-
-def load_image(img_path):
-    with profiler.timer("Load_image"):
-        if not os.path.exists(img_path):
-            raise FileNotFoundError(f"File Not Found: {img_path}")
-        bgr_array = cv2.imread(img_path, cv2.IMREAD_COLOR)
-        if bgr_array is None:
-            raise FileNotFoundError(f"Cannot Read file: {img_path}")
-        rgb_array = cv2.cvtColor(bgr_array, cv2.COLOR_BGR2RGB)
-        logging.info(f"Input Image: {img_path}")
-        logging.info(f"Image Size: {rgb_array.shape[1]}x{rgb_array.shape[0]}")
-        return rgb_array
-
-def estimate_depth(model, rgb_array):
-    with profiler.timer("Depth_estimation"):
-        depth = model.infer_image(rgb_array)
-        return cp.asarray(depth, dtype=cp.float32)
-
-def save_results(left, right, left_repaired, right_repaired, depth, output_dir, width, height):
-    with profiler.timer("Save_results"):
-        left = cp.asnumpy(left)
-        right = cp.asnumpy(right)
-        left_bgr = cv2.cvtColor(left, cv2.COLOR_RGB2BGR)
-        right_bgr = cv2.cvtColor(right, cv2.COLOR_RGB2BGR)
-        cv2.imwrite(str(Path(output_dir) / "left.png"), left_bgr)
-        cv2.imwrite(str(Path(output_dir) / "right.png"), right_bgr)
-        left_repaired = cp.asnumpy(left_repaired)
-        right_repaired = cp.asnumpy(right_repaired)
-        cv2.imwrite(str(Path(output_dir) / "left_repaired.png"), cv2.cvtColor(left_repaired, cv2.COLOR_RGB2BGR))
-        cv2.imwrite(str(Path(output_dir) / "right_repaired.png"), cv2.cvtColor(right_repaired, cv2.COLOR_RGB2BGR))
-
-        # 保存深度图
-        try:
-            with profiler.timer("Save_depth_map"):
-                depth_cpu = depth.get() if hasattr(depth, 'get') else depth
-                min_val, max_val = depth_cpu.min(), depth_cpu.max()
-                logging.info(f'Depth min: {min_val}, max: {max_val}')
-                depth_normalized = cv2.normalize(depth_cpu, None, 0, 255, cv2.NORM_MINMAX)
-                depth_uint8 = depth_normalized.astype(np.uint8)
-                cv2.imwrite(str(Path(output_dir) / 'depth.png'), depth_uint8)
-        except Exception as e:
-            logging.warning(f"Depth map save failed: {e}")
-
-def post_process(output_dir, width, height):
-    with profiler.timer("Post_process"):
-        output_dir = Path(output_dir).absolute()
-        try:
-            # 红青3D
-            with profiler.timer("Generate_red_cyan_3D"):
-                subprocess.run([
-                    "StereoscoPy",
-                    "-S", "5", "0",
-                    "-a",
-                    "-m", "color",
-                    "--cs", "red-cyan",
-                    "--lc", "rgb",
-                    str(output_dir / "left_repaired.png"),
-                    str(output_dir / "right_repaired.png"),
-                    str(output_dir / "red_cyan.jpg")
-                ], check=True)
-
-            # 左右拼接立体图
-            with profiler.timer("Generate_stereo_pair_image"):
-                subprocess.run([
-                    "ffmpeg",
-                    "-y",
-                    "-i", str(output_dir / "left_repaired.png"),
-                    "-i", str(output_dir / "right_repaired.png"),
-                    "-filter_complex",
-                    f"[0:v]scale={int(width)}:{int(height)}[img1];[img1][1:v]hstack","-frames:v", "1", str(output_dir / "stereo.jpg")
-                ], check=True)
-
-            if PARAMS["GENERATE_VIDEO"]:
-                logging.info("Generating video...")
-                with profiler.timer("Generate_video"):
-                    subprocess.run([
-                        "ffmpeg",
-                        "-y",
-                        "-loop", "1",
-                        "-i", str(output_dir / "stereo.jpg"),
-                        "-c:v", "libx264",
-                        "-t", "60",
-                        "-pix_fmt", "yuv420p",
-                        "-vf", "fps=30",
-                        str(output_dir / "stereo_output.mp4")
-                    ], check=True)
-
-        except subprocess.CalledProcessError as e:
-            logging.error(f"Failure: {e.returncode}\n{e.stderr}")
-        except Exception as e:
-            logging.error(f"Error: {str(e)}")
+    @staticmethod
+    def repair_black_regions(image):
+        """Fast black region repair (GPU-optimized)"""
+        if not PARAMS["ENABLE_REPAIR"]:
+            return cp.asnumpy(image)
+        
+        # Keep data on GPU as much as possible
+        image_gpu = cp.asarray(image, dtype=cp.float32)
+        
+        # Convert to grayscale on GPU (RGB to grayscale: 0.299*R + 0.587*G + 0.114*B)
+        if image_gpu.shape[-1] == 3:  # RGB image
+            gray_gpu = cp.dot(image_gpu[..., :3], cp.array([0.299, 0.587, 0.114], dtype=cp.float32))
         else:
-            logging.info("Panoramic to Stereo conversion completed successfully.")
-        logging.info(f"Output Dir: {output_dir}")
-
-# =============== 主流程 ===============
-def main():
-    with profiler.timer("Total_execution_time"):
-        # 1. 加载图片
-        with profiler.timer("Image_loading_and_setup"):
-            img_path = PARAMS["IMG_PATH"]
-            rgb_array = load_image(img_path)
-            height, width = rgb_array.shape[:2]
-            d_rgb = cp.asarray(rgb_array, dtype=cp.float32)
-
-        # 2. 参数计算
-        with profiler.timer("Parameter_calculation"):
-            IPD = PARAMS["IPD"]
-            PRO_RADIUS = PARAMS["PRO_RADIUS"]
-            PIXEL = PARAMS["PIXEL"]
-            CRITICAL_DEPTH = min(PARAMS["CRITICAL_DEPTH"], cal_critical_depth(IPD, PIXEL))
-            logging.info('[Stereo Parameters]\nCircular Radius: %sm\nProjection Radius: %sm\nPixel on Equator: %s\nCritical Depth: %sm\n===============================' % (IPD, PRO_RADIUS, PIXEL, CRITICAL_DEPTH))
-
-        # 3. 初始化生成器与深度估计
-        with profiler.timer("Generator_initialization"):
-            generator = StereoPano(height=height, width=width, IPD=IPD, pro_radius=PRO_RADIUS, pixel=PIXEL,
-                                   critical_depth=CRITICAL_DEPTH, vit_size=PARAMS["VIT_SIZE"], dataset=PARAMS["DATASET"])
+            gray_gpu = image_gpu
         
-        depth = estimate_depth(generator.model, rgb_array)
-        assert d_rgb.shape[:2] == depth.shape[:2]
-
-        # 4. 生成立体对
-        left, right = generator.generate_stereo_pair(d_rgb, depth)
+        # Count black pixels on GPU
+        black_pixels = cp.sum(gray_gpu == 0)
+        total_pixels = gray_gpu.size
         
-        with profiler.timer("Image_repair"):
-            left_repaired = generator.repair_black_regions(left)
-            right_repaired = generator.repair_black_regions(right)
-
-        # 5. 保存结果
-        with profiler.timer("Output_directory_creation"):
-            output_dir = generator.make_output_dir()
+        if black_pixels < total_pixels * 0.01:  # If black pixels less than 1%, skip repair
+            return cp.asnumpy(image_gpu.astype(cp.uint8))
         
-        save_results(left, right, left_repaired, right_repaired, depth, output_dir, width, height)
+        # For repair, we need to move to CPU as cv2.inpaint doesn't have GPU support
+        # But minimize the transfer by only transferring when repair is actually needed
+        image_cpu = cp.asnumpy(image_gpu.astype(cp.uint8))
+        
+        # Use faster repair algorithm on CPU
+        img_bgr = cv2.cvtColor(image_cpu, cv2.COLOR_RGB2BGR)
+        mask = np.uint8(cv2.cvtColor(image_cpu, cv2.COLOR_RGB2GRAY) == 0) * 255
+        repaired = cv2.inpaint(img_bgr, mask, inpaintRadius=2, flags=cv2.INPAINT_NS)
+        return cv2.cvtColor(repaired, cv2.COLOR_BGR2RGB)
 
-        # 6. 后处理（红青3D、左右拼接、可选视频）
-        post_process(output_dir, width, height)
+    def make_output_dir(self, base_dir='output'):
+        if base_dir is None:
+            base_dir = PARAMS["OUTPUT_BASE"]
+        index = 0
+        while True:
+            target_dir = f"{base_dir}_{index:03d}" if index >= 0 else base_dir
+            if not os.path.exists(target_dir):
+                os.makedirs(target_dir)
+                break
+            index += 1
+        logging.info(f"Output directory created: {target_dir}")
+        return target_dir
+
+    def __del__(self):
+        """Destructor to clean up resources"""
+        logging.info('[Pano2stereo] Cleaning up resources...')
+        
+        # Stop running flag to signal threads to exit
+        self.running = False
+        
+        # Stop FlashDepth inference thread
+        if hasattr(self, 'inference_thread') and self.inference_thread and self.inference_thread.is_alive():
+            logging.info('[Pano2stereo] Waiting for inference thread to finish...')
+            self.inference_thread.join(timeout=5.0)
+            if self.inference_thread.is_alive():
+                logging.warning('[Pano2stereo] Inference thread did not finish gracefully')
+        
+        # Stop RTSP streaming
+        if hasattr(self, 'stream_process'):
+            self.stop_streaming()
+        
+        # Clean up FlashDepth processor
+        if hasattr(self, 'flashdepth_processor'):
+            if hasattr(self.flashdepth_processor, 'cleanup'):
+                try:
+                    self.flashdepth_processor.cleanup()
+                    logging.info('[Pano2stereo] FlashDepth processor cleaned up')
+                except Exception as e:
+                    logging.error(f'[Pano2stereo] Error cleaning up FlashDepth processor: {e}')
+        
+        # Clean up GPU memory
+        try:
+            # Clean up CuPy memory
+            if 'cp' in globals():
+                cp.get_default_memory_pool().free_all_blocks()
+                cp.get_default_pinned_memory_pool().free_all_blocks()
+            
+            # Clean up PyTorch GPU memory
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            
+            logging.info('[Pano2stereo] GPU memory cleaned up')
+        except Exception as e:
+            logging.error(f'[Pano2stereo] Error cleaning up GPU memory: {e}')
+        
+        # Clean up precomputed coordinates
+        if hasattr(self, 'sphere_coords'):
+            del self.sphere_coords
+        if hasattr(self, 'grid_y'):
+            del self.grid_y
+        if hasattr(self, 'grid_x'):
+            del self.grid_x
+        
+        logging.info('[Pano2stereo] Resource cleanup completed')
+
+# =============== Optimized Utility Functions ===============
+
+def load_and_resize_image(img_path):
+    """Load and optionally resize image to improve speed"""
+    if not os.path.exists(img_path):
+        raise FileNotFoundError(f"File Not Found: {img_path}")
     
-    # 输出性能统计
-    logging.info(profiler.get_summary())
+    bgr_array = cv2.imread(img_path, cv2.IMREAD_COLOR)
+    if bgr_array is None:
+        raise FileNotFoundError(f"Cannot Read file: {img_path}")
+    
+    rgb_array = cv2.cvtColor(bgr_array, cv2.COLOR_BGR2RGB)
+    
+    # Optional: Resize image to improve processing speed
+    original_height, original_width = rgb_array.shape[:2]
+    if (PARAMS.get("TARGET_HEIGHT") and PARAMS.get("TARGET_WIDTH") and 
+        (original_height > PARAMS["TARGET_HEIGHT"] or original_width > PARAMS["TARGET_WIDTH"])):
+        
+        rgb_array = cv2.resize(rgb_array, (PARAMS["TARGET_WIDTH"], PARAMS["TARGET_HEIGHT"]))
+        logging.info(f"Image resized from {original_width}x{original_height} to {PARAMS['TARGET_WIDTH']}x{PARAMS['TARGET_HEIGHT']}")
+    
+    logging.info(f"Input Image: {img_path}")
+    logging.info(f"Image Size: {rgb_array.shape[1]}x{rgb_array.shape[0]}")
+    return rgb_array
+
+def save_results_optimized(left, right, left_repaired, right_repaired, depth, output_dir):
+    """Optimized result saving"""
+    # Save multiple images in parallel
+    def save_image(img, path, is_gpu=True):
+        if is_gpu and hasattr(img, 'get'):
+            img = img.get()
+        elif is_gpu:
+            img = cp.asnumpy(img)
+        
+        if len(img.shape) == 3 and img.shape[2] == 3:  # RGB image
+            img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(str(path), img_bgr)
+        else:
+            cv2.imwrite(str(path), img)
+    
+    output_path = Path(output_dir)
+    
+    # Save main images
+    save_image(left, output_path / "left.png")
+    save_image(right, output_path / "right.png")
+    save_image(left_repaired, output_path / "left_repaired.png", is_gpu=False)
+    save_image(right_repaired, output_path / "right_repaired.png", is_gpu=False)
+    
+    # Fix depth map saving, eliminate warnings
+    try:
+        # Correctly get depth data
+        if hasattr(depth, 'get'):
+            depth_cpu = depth.get()
+        elif isinstance(depth, cp.ndarray):
+            depth_cpu = cp.asnumpy(depth)
+        else:
+            depth_cpu = depth
+        
+        # Ensure numpy array
+        if not isinstance(depth_cpu, np.ndarray):
+            depth_cpu = np.array(depth_cpu)
+        
+        # Correctly handle depth map data type and range
+        if depth_cpu.dtype != np.uint8:
+            # Get valid depth values (exclude inf and nan)
+            valid_mask = np.isfinite(depth_cpu)
+            if np.any(valid_mask):
+                depth_min = np.min(depth_cpu[valid_mask])
+                depth_max = np.max(depth_cpu[valid_mask])
+                
+                # Normalize to 0-255 range
+                if depth_max > depth_min:
+                    depth_normalized = np.zeros_like(depth_cpu, dtype=np.uint8)
+                    depth_normalized[valid_mask] = ((depth_cpu[valid_mask] - depth_min) / 
+                                                   (depth_max - depth_min) * 255).astype(np.uint8)
+                else:
+                    depth_normalized = np.zeros_like(depth_cpu, dtype=np.uint8)
+            else:
+                depth_normalized = np.zeros_like(depth_cpu, dtype=np.uint8)
+        else:
+            depth_normalized = depth_cpu.astype(np.uint8)
+        
+        # Save depth map (now correct uint8 format)
+        cv2.imwrite(str(output_path / 'depth.png'), depth_normalized)
+        
+        if 'valid_mask' in locals() and np.any(valid_mask):
+            logging.info(f"Depth map saved (range: {depth_min:.3f}-{depth_max:.3f}m → 0-255)")
+        else:
+            logging.info("Depth map saved (uint8 format)")
+            
+    except Exception as e:
+        logging.warning(f"Depth map save failed: {e}")
+
+def estimate_depth_optimized(generator, rgb_array):
+    """Optimized depth estimation (using FlashDepth)"""
+    # Convert RGB image to torch tensor
+    if isinstance(rgb_array, np.ndarray):
+        rgb_tensor = torch.from_numpy(rgb_array).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+    else:
+        rgb_tensor = rgb_array
+    rgb_tensor = rgb_tensor.to(generator.device)
+    
+    # Use FlashDepthProcessor for inference
+    # Assume FlashDepthProcessor has process_single_image method
+    depth = generator.flashdepth_processor.process_single_image(rgb_tensor)
+    
+    # Update self.depth
+    generator.flashdepth_processor.depth = depth
+    
+    return cp.asarray(depth.cpu().numpy(), dtype=cp.float32)
+
+def post_process_optimized(output_dir, width, height):
+    """Optimized post-processing (optional red-cyan 3D function)"""
+    if not PARAMS["ENABLE_POST_PROCESS"]:
+        logging.info("Post-processing disabled for speed")
+        return
+        
+    output_dir = Path(output_dir).absolute()
+    try:
+        # Optional: Generate red-cyan 3D image
+        if PARAMS["ENABLE_RED_CYAN"]:
+            subprocess.run([
+                "StereoscoPy",
+                "-S", "5", "0",
+                "-a",
+                "-m", "color",
+                "--cs", "red-cyan",
+                "--lc", "rgb",
+                str(output_dir / "left_repaired.png"),
+                str(output_dir / "right_repaired.png"),
+                str(output_dir / "red_cyan.jpg")
+            ], check=True, capture_output=True)
+            logging.info("Red-cyan 3D image generated")
+        else:
+            logging.info("Red-cyan 3D generation skipped (disabled for speed)")
+
+        # Generate left-right stitched stereo image
+        subprocess.run([
+            "ffmpeg", "-y", "-loglevel", "error",  # Reduce log output
+            "-i", str(output_dir / "left_repaired.png"),
+            "-i", str(output_dir / "right_repaired.png"),
+            "-filter_complex", f"[0:v][1:v]hstack", 
+            "-frames:v", "1", 
+            str(output_dir / "stereo.jpg")
+        ], check=True, capture_output=True)
+
+        # Optional: Generate video
+        if PARAMS["GENERATE_VIDEO"]:
+            logging.info("Generating video...")
+            subprocess.run([
+                "ffmpeg", "-y", "-loglevel", "error",
+                "-loop", "1",
+                "-i", str(output_dir / "stereo.jpg"),
+                "-c:v", "libx264",
+                "-t", "60",
+                "-pix_fmt", "yuv420p",
+                "-vf", "fps=30",
+                str(output_dir / "stereo_output.mp4")
+            ], check=True, capture_output=True)
+
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Post-process failure: {e.returncode}")
+    except Exception as e:
+        logging.error(f"Post-process error: {str(e)}")
+    else:
+        red_cyan_status = "with red-cyan 3D" if PARAMS["ENABLE_RED_CYAN"] else "without red-cyan 3D"
+        logging.info(f"Post-processing completed ({red_cyan_status})")
+    
+    logging.info(f"Output Dir: {output_dir}")
+
+# =============== Main Function ===============
+def main():
+    """Optimized main function (focused on core timing)"""
+    profiler.reset()
+    print(PARAMS)
+    
+    # Configuration parameters (not participating in core timing)
+    IPD = PARAMS["IPD"]
+    PRO_RADIUS = PARAMS["PRO_RADIUS"]
+    PIXEL = PARAMS["PIXEL"]
+    CRITICAL_DEPTH = min(PARAMS["CRITICAL_DEPTH"], cal_critical_depth(IPD, PIXEL))
+    URL = PARAMS.get("URL")  # Use get() to safely handle missing URL
+    
+    try:
+        # Determine input source and get dimensions
+        if URL:
+            logging.info(f"Using video stream: {URL}")  
+        else:
+            raise ValueError("NO URL provided - please set URL in configs/pano.yaml")
+
+        # 1. Generator initialization (including model warm-up, not participating in core timing)
+        logging.info(f'[Parameters] IPD: {IPD}m, Critical Depth: {CRITICAL_DEPTH:.2f}m')
+        # Force log flush
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+            
+        generator = Pano2stereo(
+            IPD=IPD, 
+            pro_radius=PRO_RADIUS, 
+            pixel=PIXEL, 
+            critical_depth=CRITICAL_DEPTH, 
+            url=URL
+        )
+        
+        # ================== 2. Main Loop ==================
+        while generator.running:
+            # 2.1 Generate stereo pairs from depth and RGB                 
+            # self.pred = [depth_pred, original_frame]  # Store latest depth map & frame（Tensor, shape [H, W, C] in BGR)
+            depth,rgb = torch_to_cupy(generator.flashdepth_processor.pred[0], generator.flashdepth_processor.pred[1]) 
+            assert rgb.ndim == 3 and rgb.shape[2] == 3, f"RGB data shape invalid: {rgb.shape}"
+            assert depth.ndim == 2, f"Depth data shape invalid: {depth.shape}"
+            left, right = generator.generate_stereo_pair_vectorized(rgb, depth)
+        
+            # 2.2 🔧 Image repair (core timing - parallel processing)
+            # Parallel repair of left and right images            
+            # Use thread pool for parallel processing of left and right images
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                # Submit left and right image repair tasks
+                future_left = executor.submit(generator.repair_black_regions, left)
+                future_right = executor.submit(generator.repair_black_regions, right)
+                
+                # Get results
+                left_repaired = future_left.result()
+                right_repaired = future_right.result()
+
+            # Save and post-process (not participating in core timing)
+            if generator.save_result:
+                output_dir = generator.outputdir
+                save_results_optimized(left, right, left_repaired, right_repaired, depth, output_dir)
+                post_process_optimized(output_dir, generator.width, generator.height)
+
+            # Stream to target URL
+            stereo_image = np.hstack((cp.asnumpy(left_repaired), cp.asnumpy(right_repaired)))
+            # Stream the stereo image via RTSP
+            generator.stream_frame(stereo_image)
+            
+        # Memory cleanup
+        del rgb, depth, left, right
+        cp.get_default_memory_pool().free_all_blocks()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        logging.info("=== Processing completed successfully ===")
+        # Final flush
+        for handler in logging.getLogger().handlers:
+            handler.flush()
+        
+        # Stop streaming
+        generator.stop_streaming()
+            
+    except Exception as e:
+        logging.error(f"Processing failed: {str(e)}")
+        # Stop streaming on error
+        if 'generator' in locals():
+            generator.stop_streaming()
+        raise
 
 if __name__ == "__main__":
     logging_setup()
     main()
-
-
-
-
-
-
