@@ -15,33 +15,52 @@ from contextlib import contextmanager
 import gc
 import concurrent.futures  
 
+# Early logging configuration so module-level logging (before logging_setup())
+# is captured to both console and the log file. This prevents messages emitted
+# during module import from being lost to the console only.
+try:
+    os.makedirs('logs', exist_ok=True)
+except Exception:
+    pass
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(module)s:%(lineno)d - %(message)s',
+    handlers=[
+        logging.FileHandler('logs/pano2stereo.log', mode='w', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+
 def cal_critical_depth(r, pixel):
     return r / (math.sin(2 * math.pi / pixel))
 
 def torch_to_cupy(tensor1, tensor2):
     """Convert two torch tensors to CuPy arrays"""
-    # Assert that inputs are torch tensors
-    assert isinstance(tensor1, torch.Tensor), f"tensor1 must be a torch.Tensor, got {type(tensor1)}"
-    assert isinstance(tensor2, torch.Tensor), f"tensor2 must be a torch.Tensor, got {type(tensor2)}"
+    # Minimal, fast conversion with zero-copy on CUDA using DLPack when possible.
+    # If the tensor is on CUDA, use DLPack to avoid CPU<->GPU copy. Otherwise fallback to cpu->numpy->cupy.
     tensor1 = tensor1.float()
     tensor2 = tensor2.float()
-
-    # Convert first tensor (RGB data) - keep as 3D (H, W, C)
-    if tensor1.is_cuda:
-        tensor1_cupy = cp.asarray(tensor1)
-    else:
-        tensor1_cupy = cp.asarray(tensor1.numpy())
     
-    # Convert second tensor (depth data) - ensure it's 2D (H, W)
-    if tensor2.is_cuda:
-        tensor2_cupy = cp.asarray(tensor2)
-    else:
-        tensor2_cupy = cp.asarray(tensor2.numpy())
+    from torch.utils import dlpack as _dlpack
 
-    # BGR change to RGB
-    tensor2_cupy = tensor2_cupy[:, :, [2, 1, 0]]
-    
-    return tensor1_cupy, tensor2_cupy
+    def _to_cupy(x):
+        if isinstance(x, torch.Tensor):
+            if x.is_cuda:
+                # Ensure contiguous to avoid unexpected behavior
+                if not x.is_contiguous():
+                    x = x.contiguous()
+                try:
+                    return cp.fromDlpack(_dlpack.to_dlpack(x))
+                except Exception:
+                    # Fallback if DLPack path fails for any reason
+                    return cp.asarray(x.detach().cpu().numpy())
+            else:
+                return cp.asarray(x.detach().cpu().numpy())
+        else:
+            return cp.asarray(x)
+
+    return _to_cupy(tensor1), _to_cupy(tensor2)
 
 # Load parameters from YAML config file
 def load_config(file):
@@ -108,7 +127,7 @@ def load_config(file):
 
 # Load configuration parameters
 PARAMS = load_config('configs/pano.yaml')
-logging.info(f"Loaded parameters: {PARAMS}")
+# logging.info(f"Loaded parameters: {PARAMS}")
 
 # ================== Performance Monitoring ==================
 class PerformanceProfiler:
@@ -185,16 +204,36 @@ def logging_setup():
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    # Include module and line number to help quickly locate the source of messages
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(module)s:%(lineno)d - %(message)s')
     file_handler.setFormatter(formatter)
     console_handler.setFormatter(formatter)
     
     # Get root logger and configure
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
-    root_logger.handlers.clear()  # Clear existing handlers
+    # Clear existing handlers and install our handlers
+    root_logger.handlers.clear()
     root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
+
+    # Ensure other existing loggers (from submodules) propagate to root so
+    # their messages are captured by the root handlers. Some libraries add
+    # their own handlers; remove them to centralize logging to our file.
+    try:
+        for name, logger_obj in list(logging.root.manager.loggerDict.items()):
+            # Skip internal entries that are not Logger instances
+            if not isinstance(logger_obj, logging.Logger):
+                continue
+            # Remove any handlers on the logger and let it propagate to root
+            try:
+                logger_obj.handlers.clear()
+                logger_obj.propagate = True
+            except Exception:
+                pass
+    except Exception:
+        # Non-fatal; best-effort
+        pass
     
     # Force flush
     logging.info("=== Pano2Stereo Optimized Processing Started ===")
@@ -243,8 +282,7 @@ class Pano2stereo():
         
         # Load model
         logging.info("Initializing FlashDepth model...")
-        self.flashdepth_processor = FlashDepthProcessor(config_path="configs/flashdepth.yaml", url=self.url, stream_mode=True, save_depth_png=False, save_frame=False, max_frames=None) 
-        logging.info('[FlashDepth] Model loaded')
+        self.flashdepth_processor = FlashDepthProcessor(config_path="configs/flashdepth.yaml", url=self.url, stream_mode=True, save_depth_png=False, save_frame=False, max_frames=20, run_dir=self.outputdir)
         
         # Start FlashDepth inference in a separate thread
         self.inference_thread = threading.Thread(target=self.flashdepth_processor.run_inference, daemon=True)
@@ -283,19 +321,24 @@ class Pano2stereo():
             output_height = self.height
             
             # ffmpeg command for RTSP streaming
+            # Low-latency friendly ffmpeg options; keep rawvideo RGB24 input from stdin
             ffmpeg_cmd = [
                 'ffmpeg',
-                '-y',  # Overwrite output files
+                '-loglevel', 'debug',
+                '-y',
                 '-f', 'rawvideo',
-                '-vcodec', 'rawvideo',
-                '-s', f'{output_width}x{output_height}',  # Frame size
                 '-pix_fmt', 'rgb24',
-                '-r', str(self.stream_fps),  # Frame rate
-                '-i', '-',  # Input from stdin
+                '-s', f'{output_width}x{output_height}',
+                '-r', str(self.stream_fps),
+                '-i', '-',
                 '-c:v', 'libx264',
                 '-preset', 'ultrafast',
                 '-tune', 'zerolatency',
-                '-g', '30',  # GOP size
+                '-g', '30',
+                '-fflags', 'nobuffer',
+                '-flags', 'low_delay',
+                '-max_delay', '0',
+                '-flush_packets', '1',
                 '-f', 'rtsp',
                 '-rtsp_transport', 'tcp',
                 self.target_url
@@ -303,15 +346,39 @@ class Pano2stereo():
             
             logging.info(f"Initializing RTSP stream to {self.target_url}")
             logging.info(f"Stream resolution: {output_width}x{output_height} @ {self.stream_fps}fps")
-            
-            # Start ffmpeg process
+
+            # Start ffmpeg process and capture stderr for diagnostics
+            # Prepare per-run stream directory and ffmpeg debug log file
+            try:
+                stream_dir = Path(self.outputdir) / 'stream'
+                stream_dir.mkdir(parents=True, exist_ok=True)
+                ffmpeg_log_path = stream_dir / 'ffmpeg_debug.log'
+                # Open in append-binary mode so ffmpeg bytes can be written directly
+                self._ffmpeg_log_file = open(str(ffmpeg_log_path), 'ab')
+            except Exception as e:
+                logging.warning(f"Failed to open ffmpeg debug log file: {e}; falling back to DEVNULL")
+                self._ffmpeg_log_file = None
+
+            # Launch ffmpeg; write stderr to per-run debug file when available
+            stderr_target = self._ffmpeg_log_file if self._ffmpeg_log_file is not None else subprocess.DEVNULL
             self.stream_process = subprocess.Popen(
                 ffmpeg_cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
+                stderr=stderr_target,
+                bufsize=0
             )
-            
+
+            if self._ffmpeg_log_file:
+                logging.info(f"ffmpeg debug log: {ffmpeg_log_path}")
+
+            # Short delay and check process health
+            time.sleep(0.2)
+            if self.stream_process.poll() is not None:
+                logging.error(f"ffmpeg exited immediately with code {self.stream_process.returncode}")
+                # Let caller know stream wasn't initialized
+                raise RuntimeError("ffmpeg failed to start streaming; check ffmpeg stderr in logs")
+
             logging.info("RTSP streaming initialized successfully")
             
         except Exception as e:
@@ -325,12 +392,58 @@ class Pano2stereo():
                 # Ensure frame is in correct format (RGB, uint8)
                 if isinstance(frame, cp.ndarray):
                     frame = cp.asnumpy(frame)
+                # Ensure correct dtype and contiguous layout
                 if frame.dtype != np.uint8:
                     frame = frame.astype(np.uint8)
-                
+                frame = np.ascontiguousarray(frame)
+
                 # Write frame to ffmpeg stdin
-                self.stream_process.stdin.write(frame.tobytes())
-                self.stream_process.stdin.flush()
+                try:
+                    # Validate expected frame size: height x (width*2) x 3
+                    expected_h = getattr(self, 'height', None)
+                    expected_w = getattr(self, 'width', None)
+                    if expected_h is not None and expected_w is not None:
+                            expected_shape = (expected_h, expected_w * 2, 3)
+                            if frame.shape != expected_shape:
+                                logging.warning(f"Frame shape mismatch: got {frame.shape}, expected {expected_shape}.")
+                                # Try to derive new dimensions from incoming frame
+                                new_h, new_w_total = frame.shape[0], frame.shape[1]
+                                # If width is even, assume side-by-side stereo (two halves)
+                                if new_w_total % 2 == 0:
+                                    new_w = new_w_total // 2
+                                else:
+                                    new_w = None
+
+                                # If difference is small, just resize to expected shape and continue streaming
+                                if new_w is not None and abs(new_h - expected_h) <= 8 and abs(new_w - expected_w) <= 8:
+                                    logging.info(f"Resizing minor-mismatch frame {frame.shape} -> {expected_shape}")
+                                    try:
+                                        frame = cv2.resize(frame, (expected_w * 2, expected_h), interpolation=cv2.INTER_LINEAR)
+                                    except Exception as e:
+                                        logging.error(f"Failed to resize frame: {e}. Skipping frame.")
+                                        return
+                                else:
+                                    # Significant change: resize frame to match current stream resolution
+                                    if new_w is not None:
+                                        logging.info(f"Resizing significant-mismatch frame {frame.shape} -> {expected_shape}")
+                                        try:
+                                            frame = cv2.resize(frame, (expected_w * 2, expected_h), interpolation=cv2.INTER_LINEAR)
+                                        except Exception as e:
+                                            logging.error(f"Failed to resize frame: {e}. Skipping frame.")
+                                            return
+                                    else:
+                                        logging.error("Incoming frame width is odd; cannot split into two views. Skipping frame.")
+                                        return
+                    data = frame.tobytes()
+                    logging.debug(f"Writing frame to ffmpeg stdin: bytes={len(data)}, expected={frame.size}")
+                    self.stream_process.stdin.write(data)
+                    self.stream_process.stdin.flush()
+                except BrokenPipeError:
+                    logging.warning("ffmpeg stdin broken (BrokenPipeError). Restarting stream process")
+                    self._restart_streaming()
+                except Exception as e:
+                    logging.error(f"Failed to write frame to ffmpeg stdin: {e}")
+                    self._restart_streaming()
                 
             except Exception as e:
                 logging.error(f"Failed to stream frame: {e}")
@@ -348,7 +461,21 @@ class Pano2stereo():
                 self.stream_process.wait(timeout=5)
             except:
                 self.stream_process.kill()
-        
+        # Close ffmpeg log file handle if open (we'll reopen in _init_streaming)
+        try:
+            if hasattr(self, '_ffmpeg_log_file') and self._ffmpeg_log_file is not None:
+                try:
+                    self._ffmpeg_log_file.flush()
+                except Exception:
+                    pass
+                try:
+                    self._ffmpeg_log_file.close()
+                except Exception:
+                    pass
+                self._ffmpeg_log_file = None
+        except Exception:
+            pass
+
         self._init_streaming()
 
     def stop_streaming(self):
@@ -365,6 +492,20 @@ class Pano2stereo():
                     self.stream_process.kill()
                 except:
                     pass
+        # Close ffmpeg debug log file if open
+        try:
+            if hasattr(self, '_ffmpeg_log_file') and self._ffmpeg_log_file is not None:
+                try:
+                    self._ffmpeg_log_file.flush()
+                except Exception:
+                    pass
+                try:
+                    self._ffmpeg_log_file.close()
+                except Exception:
+                    pass
+                self._ffmpeg_log_file = None
+        except Exception:
+            pass
 
     def _precompute_sphere_coords(self, image_width, image_height):
         """Optimized spherical coordinate precomputation"""
@@ -419,7 +560,7 @@ class Pano2stereo():
         with profiler.timer("Sphere2pano_vectorized"):
             # Ensure z_vals is 2D
             z_vals = cp.asarray(z_vals)
-            assert z_vals.ndim == 2, "z_vals must be 2D, got shape"
+            assert z_vals.ndim == 2, "z_vals must be 2D, got shape {}".format(z_vals.shape)
             
             R = cp.asarray(sphere_coords[..., 0])
             theta = cp.asarray(sphere_coords[..., 1])
@@ -434,18 +575,15 @@ class Pano2stereo():
                 cp.stack([R, theta, phi_r], axis=-1)
             )
 
-    def generate_stereo_pair_vectorized(self, rgb_data, depth_data):
+    def generate_stereo_pair(self, rgb_data, depth_data):
+        # print('-----------------[Generate_stereo_pairs]-----------\nSelf size: {}x{}, Depth size: {}x{}'.format(self.width, self.height, depth_data.shape[1], depth_data.shape[0]))
         """Original version of efficient stereo pair generation"""
-        with profiler.timer("Generate_stereo_pair_total"):
-            logging.info("=============== Generating stereo pair (Original Method) ================")
-            
+        with profiler.timer("Generate_stereo_pair_total"):           
             with profiler.timer("Sphere2pano_calculation"):
                 sphere_l, sphere_r = self.sphere2pano_vectorized(self.sphere_coords, depth_data)
-            
             with profiler.timer("Coordinate_mapping"):
                 coords_l = self.sphere_to_image_coords(sphere_l, self.width, self.height)
                 coords_r = self.sphere_to_image_coords(sphere_r, self.width, self.height)
-            
             with profiler.timer("Image_sampling"):
                 xl, yl = coords_l[..., 0], coords_l[..., 1]
                 xr, yr = coords_r[..., 0], coords_r[..., 1]
@@ -455,10 +593,6 @@ class Pano2stereo():
                 right[cp.arange(self.height)[:, None], cp.arange(self.width), :] = rgb_data[yr, xr, :]
             
             return left, right
-
-    def generate_stereo_pair(self, rgb_array, depth):
-        """Unified stereo pair generation entry"""
-        return self.generate_stereo_pair_vectorized(rgb_array, depth)
 
     @staticmethod
     def repair_black_regions(image):
@@ -493,17 +627,30 @@ class Pano2stereo():
         return cv2.cvtColor(repaired, cv2.COLOR_BGR2RGB)
 
     def make_output_dir(self, base_dir='output'):
+        """Create output directory under a parent folder as run_XXX.
+
+        Examples:
+        - default: output/run_000
+        - with base_dir 'results/output': results/output/run_000
+        """
+        # Determine parent directory. If caller passed None, fall back to configured OUTPUT_BASE
         if base_dir is None:
-            base_dir = PARAMS["OUTPUT_BASE"]
+            base_dir = PARAMS.get("OUTPUT_BASE", "output")
+
+        parent_dir = Path(base_dir)
+        # Ensure parent exists
+        parent_dir.mkdir(parents=True, exist_ok=True)
+
         index = 0
         while True:
-            target_dir = f"{base_dir}_{index:03d}" if index >= 0 else base_dir
-            if not os.path.exists(target_dir):
-                os.makedirs(target_dir)
+            target_dir = parent_dir / f"run_{index:03d}"
+            if not target_dir.exists():
+                target_dir.mkdir(parents=True, exist_ok=False)
                 break
             index += 1
+
         logging.info(f"Output directory created: {target_dir}")
-        return target_dir
+        return str(target_dir)
 
     def __del__(self):
         """Destructor to clean up resources"""
@@ -762,14 +909,29 @@ def main():
             url=URL
         )
         
+        # Create stereo_img directory and initialize frame counter
+        stereo_dir = Path(generator.outputdir) / "stereo_img"
+        stereo_dir.mkdir(parents=True, exist_ok=True)
+        frame_count = 0
+        
         # ================== 2. Main Loop ==================
         while generator.running:
+            # If FlashDepthProcessor has finished (e.g., reached max_frames), stop the main generator loop
+            try:
+                if generator.flashdepth_processor.stopped:
+                    logging.info('[Pano2stereo] Detected FlashDepthProcessor stopped flag; Stopping')
+                    generator.running = False
+                    break
+            except Exception:
+                # Defensive: ignore attribute errors and continue
+                pass
             # 2.1 Generate stereo pairs from depth and RGB                 
             # self.pred = [depth_pred, original_frame]  # Store latest depth map & frame（Tensor, shape [H, W, C] in BGR)
-            depth,rgb = torch_to_cupy(generator.flashdepth_processor.pred[0], generator.flashdepth_processor.pred[1]) 
-            assert rgb.ndim == 3 and rgb.shape[2] == 3, f"RGB data shape invalid: {rgb.shape}"
-            assert depth.ndim == 2, f"Depth data shape invalid: {depth.shape}"
-            left, right = generator.generate_stereo_pair_vectorized(rgb, depth)
+            depth, bgr = torch_to_cupy(generator.flashdepth_processor.pred[0], generator.flashdepth_processor.pred[1])
+            rgb = bgr[..., ::-1]  # Convert BGR to RGB
+            logging.info(f"Depth shape: {depth.shape}, RGB shape: {rgb.shape}")
+            # At this point we trust FlashDepth: rgb and depth are same resolution
+            left, right = generator.generate_stereo_pair(rgb_data=rgb, depth_data=depth)
         
             # 2.2 🔧 Image repair (core timing - parallel processing)
             # Parallel repair of left and right images            
@@ -791,6 +953,20 @@ def main():
 
             # Stream to target URL
             stereo_image = np.hstack((cp.asnumpy(left_repaired), cp.asnumpy(right_repaired)))
+            logging.info(f"Streaming frame size: {stereo_image.shape[1]}x{stereo_image.shape[0]}")
+            # Generate Red-Cyan anaglyph
+            red_cyan = np.zeros_like(left_repaired, dtype=np.uint8)
+            red_cyan[:, :, 0] = left_repaired[:, :, 0]  # Red channel from left eye
+            red_cyan[:, :, 1] = right_repaired[:, :, 1]  # Green channel from right eye
+            red_cyan[:, :, 2] = right_repaired[:, :, 2]  # Blue channel from right eye
+            # Save stereo_image to local before streaming
+            stereo_path = stereo_dir / f"stereo_{frame_count:03d}.png"
+            cv2.imwrite(str(stereo_path), cv2.cvtColor(stereo_image, cv2.COLOR_RGB2BGR))
+
+            # Save Red-Cyan anaglyph
+            red_cyan_path = stereo_dir / f"red_cyan_{frame_count:03d}.png"
+            cv2.imwrite(str(red_cyan_path), cv2.cvtColor(red_cyan, cv2.COLOR_RGB2BGR))
+            frame_count += 1
             # Stream the stereo image via RTSP
             generator.stream_frame(stereo_image)
             

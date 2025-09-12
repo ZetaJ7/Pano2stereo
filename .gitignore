@@ -1,8 +1,10 @@
 .vscode
 results/*
+result/*
 *.pth
 *.log
 Data/snapshots/
 Data/avatii/
 Data/AvatarVision/
 Data/3D60
+output*
