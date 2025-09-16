@@ -14,6 +14,8 @@ import cupy as cp
 from contextlib import contextmanager
 import gc
 import concurrent.futures  
+from PIL import Image
+import stereoscopy
 
 # Early logging configuration so module-level logging (before logging_setup())
 # is captured to both console and the log file. This prevents messages emitted
@@ -303,7 +305,7 @@ class Pano2stereo():
         # Now initialize RTSP streaming with correct dimensions
         self._init_streaming()
         
-        # Optimize: Precompute all required coordinate transformations
+        # Precompute all required coordinate transformations
         logging.info("Precomputing sphere coordinates...")
         self.sphere_coords = self._precompute_sphere_coords(self.width, self.height)
         # Precompute grid coordinates for fast sampling
@@ -652,6 +654,40 @@ class Pano2stereo():
         logging.info(f"Output directory created: {target_dir}")
         return str(target_dir)
 
+    def disparity_to_depth(self, disparity_map, critical_depth):
+        """Convert disparity map to depth map and clamp to valid range.
+
+        Each pixel x -> depth = 100.0 / x. Then negative depths are set to 0
+        and values greater than `critical_depth` are clamped to `critical_depth`.
+
+        Arguments:
+            disparity_map: CuPy or NumPy array of disparities.
+            critical_depth: scalar maximum depth (float).
+        Returns:
+            depth_map: array (same type as input) with depths in [0, critical_depth].
+        """
+        # Work with CuPy on GPU when available to avoid unnecessary copies
+        try:
+            if 'cp' in globals() and isinstance(disparity_map, cp.ndarray):
+                # Avoid division by zero by flooring small disparities to a tiny positive value
+                d = cp.clip(disparity_map, 1e-6, cp.inf)
+                depth_map = 100.0 / d
+                # Replace non-finite results with 0, clamp negatives to 0, and clamp to critical_depth
+                depth_map = cp.where(cp.isfinite(depth_map), depth_map, 0.0)
+                depth_map = cp.clip(depth_map, 0.0, float(critical_depth))
+                return depth_map
+        except Exception:
+            # Fall through to numpy implementation on any CuPy failure
+            pass
+
+        # NumPy fallback (CPU)
+        import numpy as _np
+        d_np = _np.clip(_np.asarray(disparity_map), 1e-6, _np.inf)
+        depth_map = 100.0 / d_np
+        depth_map = _np.where(_np.isfinite(depth_map), depth_map, 0.0)
+        depth_map = _np.clip(depth_map, 0.0, float(critical_depth))
+        return depth_map
+    
     def __del__(self):
         """Destructor to clean up resources"""
         logging.info('[Pano2stereo] Cleaning up resources...')
@@ -798,6 +834,107 @@ def save_results_optimized(left, right, left_repaired, right_repaired, depth, ou
     except Exception as e:
         logging.warning(f"Depth map save failed: {e}")
 
+
+def save_depth_visualization(depth, stereo_dir, frame_count, generator, critical_depth):
+    """Save a gray depth image with an annotated colorbar appended on the right.
+
+    - depth: NumPy or CuPy array (H,W) or (H,W,1)
+    - stereo_dir: Path-like directory where files will be saved
+    - frame_count: integer for filename formatting
+    - generator: Pano2stereo instance (used to read generator.critical_depth)
+    - critical_depth: fallback critical depth value
+    """
+    try:
+        # Convert to numpy
+        if 'cp' in globals() and isinstance(depth, cp.ndarray):
+            depth_np = cp.asnumpy(depth)
+        else:
+            depth_np = np.asarray(depth)
+
+        # Squeeze channel if necessary
+        if depth_np.ndim == 3:
+            if depth_np.shape[2] == 1:
+                depth_np = depth_np[..., 0]
+            else:
+                depth_np = depth_np[..., 0]
+
+        # Determine critical depth
+        try:
+            critical = getattr(generator, 'critical_depth', None)
+        except Exception:
+            critical = None
+        if critical is None:
+            critical = critical_depth
+
+        # Clip and normalize to [0, critical]
+        depth_clipped = np.where(np.isfinite(depth_np), depth_np, 0.0)
+        depth_clipped = np.clip(depth_clipped, 0.0, float(critical))
+        if float(critical) > 0.0:
+            norm = depth_clipped.astype(np.float32) / float(critical)
+        else:
+            norm = np.zeros_like(depth_clipped, dtype=np.float32)
+        norm = np.clip(norm, 0.0, 1.0)
+
+        gray = (norm * 255.0).astype(np.uint8)
+
+        # Generate GRAYSCALE colorbar (match gray image) with a right-side label area
+        h, w = gray.shape[:2]
+        cb_width_base = max(40, w // 12)
+        label_area = 70  # space to the right of the bar for labels
+        cb_width = cb_width_base + label_area
+
+        # Vertical gradient: top=near(0), bottom=far(critical)
+        gradient = np.linspace(1.0, 0.0, h, dtype=np.float32)
+        gradient_gray = (gradient * 255.0).astype(np.uint8)
+        # Create a grayscale bar (H x cb_width_base)
+        bar = np.tile(gradient_gray[:, None], (1, cb_width_base))
+        bar_rgb = np.stack([bar, bar, bar], axis=-1)
+
+        # Create full colorbar area with label background (white)
+        cb_full = np.ones((h, cb_width, 3), dtype=np.uint8) * 255
+        cb_full[:, :cb_width_base, :] = bar_rgb
+
+        # Annotate ticks and labels on the label area (white background) for readability
+        num_ticks = 5
+        for i in range(num_ticks):
+            y = int(i * (h - 1) / (num_ticks - 1))
+            # Tick on the bar portion (black)
+            cv2.line(cb_full, (0, y), (min(12, cb_width_base - 1), y), (0, 0, 0), 1)
+            val = (1.0 - (i / (num_ticks - 1))) * float(critical)
+            # Label on the right label area
+            label = f"{val:.2f}m"
+            txt_x = cb_width_base + 6
+            txt_y = y + 4
+            # Draw white outline then black text for good contrast
+            cv2.putText(cb_full, label, (txt_x, txt_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 3, cv2.LINE_AA)
+            cv2.putText(cb_full, label, (txt_x, txt_y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0), 1, cv2.LINE_AA)
+
+        cb_rgb = cb_full  # already RGB-like (white labels area)
+
+        # Assemble output image: gray_rgb (left) + cb_rgb (right)
+        gray_rgb = np.stack([gray, gray, gray], axis=-1)
+        try:
+            combined = np.concatenate([gray_rgb, cb_rgb], axis=1)
+        except Exception:
+            combined = gray_rgb
+
+        depth_gray_path = Path(stereo_dir) / f"depth_gray_{frame_count:03d}.png"
+
+        # Sanity: log mapping between depth values and bar endpoints to detect inversion
+        try:
+            # combined: left gray_rgb, right cb_rgb
+            top_bar_pixel = combined[0, gray_rgb.shape[1] // 2, 0] if combined.shape[1] > gray_rgb.shape[1] else combined[0, 0, 0]
+            bottom_bar_pixel = combined[-1, gray_rgb.shape[1] // 2, 0] if combined.shape[1] > gray_rgb.shape[1] else combined[-1, 0, 0]
+            logging.info(f"Depth->gray mapping: 0.0 -> black (0), {critical} -> white (255). Colorbar endpoints (top,bottom) pixel values: ({int(top_bar_pixel)},{int(bottom_bar_pixel)})")
+        except Exception:
+            pass
+
+        cv2.imwrite(str(depth_gray_path), cv2.cvtColor(combined, cv2.COLOR_RGB2BGR))
+        logging.info(f"Saved depth visualization (gray+colorbar): {depth_gray_path.name}")
+    except Exception as e:
+        logging.warning(f"Failed to save depth visualization: {e}")
+
+
 def estimate_depth_optimized(generator, rgb_array):
     """Optimized depth estimation (using FlashDepth)"""
     # Convert RGB image to torch tensor
@@ -826,18 +963,35 @@ def post_process_optimized(output_dir, width, height):
     try:
         # Optional: Generate red-cyan 3D image
         if PARAMS["ENABLE_RED_CYAN"]:
-            subprocess.run([
-                "StereoscoPy",
-                "-S", "5", "0",
-                "-a",
-                "-m", "color",
-                "--cs", "red-cyan",
-                "--lc", "rgb",
-                str(output_dir / "left_repaired.png"),
-                str(output_dir / "right_repaired.png"),
-                str(output_dir / "red_cyan.jpg")
-            ], check=True, capture_output=True)
-            logging.info("Red-cyan 3D image generated")
+            # Prefer using the stereoscopy Python API (faster, no subprocess)
+            try:
+                left_path = output_dir / "left_repaired.png"
+                right_path = output_dir / "right_repaired.png"
+
+                left_img = Image.open(str(left_path)).convert('RGB')
+                right_img = Image.open(str(right_path)).convert('RGB')
+
+                # create_anaglyph expects a list of two PIL images
+                anaglyph = stereoscopy.create_anaglyph([left_img, right_img], method="color", color_scheme="red-cyan", luma_coding="rgb")
+                anaglyph.save(str(output_dir / "red_cyan.png"))
+                logging.info("Red-cyan 3D image generated (via stereoscopy package)")
+            except Exception as e:
+                logging.warning(f"stereoscopy package failed or not available: {e}; falling back to StereoscoPy subprocess")
+                try:
+                    subprocess.run([
+                        "StereoscoPy",
+                        "-S", "5", "0",
+                        "-a",
+                        "-m", "color",
+                        "--cs", "red-cyan",
+                        "--lc", "rgb",
+                        str(output_dir / "left_repaired.png"),
+                        str(output_dir / "right_repaired.png"),
+                        str(output_dir / "red_cyan.png")
+                    ], check=True, capture_output=True)
+                    logging.info("Red-cyan 3D image generated (via subprocess StereoscoPy)")
+                except subprocess.CalledProcessError as e:
+                    logging.error(f"Red-cyan generation failed (subprocess): {e.returncode}")
         else:
             logging.info("Red-cyan 3D generation skipped (disabled for speed)")
 
@@ -879,7 +1033,7 @@ def post_process_optimized(output_dir, width, height):
 def main():
     """Optimized main function (focused on core timing)"""
     profiler.reset()
-    print(PARAMS)
+    # print(PARAMS)
     
     # Configuration parameters (not participating in core timing)
     IPD = PARAMS["IPD"]
@@ -925,9 +1079,50 @@ def main():
             except Exception:
                 # Defensive: ignore attribute errors and continue
                 pass
+
             # 2.1 Generate stereo pairs from depth and RGB                 
             # self.pred = [depth_pred, original_frame]  # Store latest depth map & frame（Tensor, shape [H, W, C] in BGR)
             depth, bgr = torch_to_cupy(generator.flashdepth_processor.pred[0], generator.flashdepth_processor.pred[1])
+
+            # TODO: the physical meaning of depth = 100/x (m)?? 
+            depth = generator.disparity_to_depth(disparity_map=depth, critical_depth=CRITICAL_DEPTH)  # Convert to meters and clamp
+            
+            # Compute and log basic statistics for the depth map we just received.
+            try:
+                # depth may be a CuPy array or NumPy array; handle both
+                if 'cp' in globals() and isinstance(depth, cp.ndarray):
+                    # Move minimal statistics to CPU without copying entire array if possible
+                    # Use CuPy's reduction which is efficient on GPU
+                    # Filter out non-finite values
+                    finite_mask = cp.isfinite(depth)
+                    if cp.any(finite_mask):
+                        depth_min = float(cp.min(depth[finite_mask]).get())
+                        depth_max = float(cp.max(depth[finite_mask]).get())
+                        depth_mean = float(cp.mean(depth[finite_mask]).get())
+                    else:
+                        depth_min = float('nan')
+                        depth_max = float('nan')
+                        depth_mean = float('nan')
+                else:
+                    # Assume NumPy array-like
+                    import numpy as _np
+                    depth_np = _np.asarray(depth)
+                    finite_mask = _np.isfinite(depth_np)
+                    if _np.any(finite_mask):
+                        depth_min = float(_np.min(depth_np[finite_mask]))
+                        depth_max = float(_np.max(depth_np[finite_mask]))
+                        depth_mean = float(_np.mean(depth_np[finite_mask]))
+                    else:
+                        depth_min = float('nan')
+                        depth_max = float('nan')
+                        depth_mean = float('nan')
+                logging.info(f"Depth stats — min: {depth_min:.6g}, max: {depth_max:.6g}, mean: {depth_mean:.6g}")
+            except Exception as _e:
+                logging.warning(f"Failed to compute depth statistics: {_e}")
+
+            # Save depth visualization (gray + annotated colorbar)
+            save_depth_visualization(depth, stereo_dir, frame_count, generator, CRITICAL_DEPTH)
+            
             rgb = bgr[..., ::-1]  # Convert BGR to RGB
             logging.info(f"Depth shape: {depth.shape}, RGB shape: {rgb.shape}")
             # At this point we trust FlashDepth: rgb and depth are same resolution
@@ -951,25 +1146,44 @@ def main():
                 save_results_optimized(left, right, left_repaired, right_repaired, depth, output_dir)
                 post_process_optimized(output_dir, generator.width, generator.height)
 
+            # 2.3  Streaming
             # Stream to target URL
             stereo_image = np.hstack((cp.asnumpy(left_repaired), cp.asnumpy(right_repaired)))
             logging.info(f"Streaming frame size: {stereo_image.shape[1]}x{stereo_image.shape[0]}")
+            
+            # 2.4 Saving results
+
             # Generate Red-Cyan anaglyph
-            red_cyan = np.zeros_like(left_repaired, dtype=np.uint8)
-            red_cyan[:, :, 0] = left_repaired[:, :, 0]  # Red channel from left eye
-            red_cyan[:, :, 1] = right_repaired[:, :, 1]  # Green channel from right eye
-            red_cyan[:, :, 2] = right_repaired[:, :, 2]  # Blue channel from right eye
+            # Convert left_repaired/right_repaired to CPU numpy arrays
+            left_np = cp.asnumpy(left_repaired)
+            right_np = cp.asnumpy(right_repaired)
+
+            # Convert to PIL Images and call stereoscopy API
+            left_img = Image.fromarray(left_np)
+            right_img = Image.fromarray(right_np)
+
+            anaglyph = stereoscopy.create_anaglyph([left_img, right_img], method="color", color_scheme="red-cyan", luma_coding="rgb")
+            red_cyan_path = stereo_dir / f"red_cyan_{frame_count:03d}.png"
+            anaglyph.save(str(red_cyan_path))
+
+            # red_cyan = np.zeros_like(left_repaired, dtype=np.uint8)
+            # red_cyan[:, :, 0] = left_repaired[:, :, 0]  # Red channel from left eye
+            # red_cyan[:, :, 1] = right_repaired[:, :, 1]  # Green channel from right eye
+            # red_cyan[:, :, 2] = right_repaired[:, :, 2]  # Blue channel from right eye
+            
+            # Save Red-Cyan anaglyph
+            # red_cyan_path = stereo_dir / f"red_cyan_{frame_count:03d}.png"
+            # cv2.imwrite(str(red_cyan_path), cv2.cvtColor(red_cyan, cv2.COLOR_RGB2BGR))
+            
             # Save stereo_image to local before streaming
             stereo_path = stereo_dir / f"stereo_{frame_count:03d}.png"
             cv2.imwrite(str(stereo_path), cv2.cvtColor(stereo_image, cv2.COLOR_RGB2BGR))
 
-            # Save Red-Cyan anaglyph
-            red_cyan_path = stereo_dir / f"red_cyan_{frame_count:03d}.png"
-            cv2.imwrite(str(red_cyan_path), cv2.cvtColor(red_cyan, cv2.COLOR_RGB2BGR))
             frame_count += 1
             # Stream the stereo image via RTSP
             generator.stream_frame(stereo_image)
-            
+            # generator.stream_frame(red_cyan_path)  # Stream the red-cyan image 
+
         # Memory cleanup
         del rgb, depth, left, right
         cp.get_default_memory_pool().free_all_blocks()
