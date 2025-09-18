@@ -1,12 +1,12 @@
 # Generating Pano Stereopairs from single pano and depth estimation
 ---
 ## Pipeline for Stereoscopic stitching work(Each frame)
-1. Using DepthAnythingV2 to estimate depth (TODO: Using FlashDepth to get continuous depth and real-time efficency)
+1. Using FlashDepth to get continuous depth and real-time efficency
 2. Convert image coords(xy) into sphere coords(R,theta,phi)
 3. Generate Pano Stereo pairs from sphere coords and depth, according to Circular Projection
 4. Convert left and right sphere coords back to image coords(xy)
-5. Repair blank regions caused by stereo reprojection
-6. (optional) Generate Red-cyan image, stereo image(left-right) and stereo videos
+5. Repair black regions caused by stereo reprojection
+6. (optional) Generate Red-cyan image, stereo image(left-right) and stereo stream
 ---
 ## Using StereoscoPy to Generate Red-Cyan stereoscopic pairs
 install: pip install stereoscopy

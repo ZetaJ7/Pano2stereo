@@ -142,171 +142,73 @@ class PerformanceProfiler:
         self.timings.clear()
         self.active_timers.clear()
     
-    def get_timing(self, name):
-        """Get the latest time for the specified timer"""
-        if name in self.timings and self.timings[name]:
-            return self.timings[name][-1]  # Return the latest time
-        return None
-    
     @contextmanager
-    def timer(self, name):
-        start_time = time.perf_counter()
+    def timer(self, name: str):
+        """Context manager for timing a code block.
+
+        Usage:
+            with profiler.timer('task'):
+                do_work()
+        """
+        start = time.time()
         try:
             yield
         finally:
-            end_time = time.perf_counter()
-            elapsed = end_time - start_time
-            if name not in self.timings:
-                self.timings[name] = []
-            self.timings[name].append(elapsed)
-            
-            # Output immediately and flush log
-            message = f"[TIMER] {name}: {elapsed:.4f}s"
-            logging.info(message)
-            # Force flush all handlers
-            for handler in logging.getLogger().handlers:
-                handler.flush()
-    
-    def get_summary(self):
-        summary = "\n" + "="*50 + "\n[TIMER] Performance Summary:\n" + "="*50
-        total_time = 0
-        for name, times in self.timings.items():
-            avg_time = sum(times) / len(times)
-            max_time = max(times)
-            min_time = min(times)
-            total_time += sum(times)
-            summary += f"\n{name}:"
-            summary += f"\n  Average: {avg_time:.4f}s"
-            summary += f"\n  Min: {min_time:.4f}s"
-            summary += f"\n  Max: {max_time:.4f}s"
-            summary += f"\n  Total: {sum(times):.4f}s"
-            summary += f"\n  Count: {len(times)}"
-        summary += f"\n{'-'*50}"
-        summary += f"\nTotal execution time: {total_time:.4f}s"
-        summary += f"\n{'='*50}"
-        return summary
-
-# Global performance profiler
-profiler = PerformanceProfiler()
-
-def logging_setup():
-    # Set OpenCV log level to reduce warnings
-    try:
-        cv2.setLogLevel(3)  # 3=ERROR level, reduce warning messages
-    except:
-        pass  # Skip if setting fails
-    
-    # Ensure logs directory exists
-    os.makedirs('logs', exist_ok=True)
-    
-    # Configure logging - force flush buffer
-    file_handler = logging.FileHandler('logs/pano2stereo.log', mode='w', encoding='utf-8')
-    file_handler.setLevel(logging.INFO)
-    
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    
-    # Include module and line number to help quickly locate the source of messages
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(module)s:%(lineno)d - %(message)s')
-    file_handler.setFormatter(formatter)
-    console_handler.setFormatter(formatter)
-    
-    # Get root logger and configure
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
-    # Clear existing handlers and install our handlers
-    root_logger.handlers.clear()
-    root_logger.addHandler(file_handler)
-    root_logger.addHandler(console_handler)
-
-    # Ensure other existing loggers (from submodules) propagate to root so
-    # their messages are captured by the root handlers. Some libraries add
-    # their own handlers; remove them to centralize logging to our file.
-    try:
-        for name, logger_obj in list(logging.root.manager.loggerDict.items()):
-            # Skip internal entries that are not Logger instances
-            if not isinstance(logger_obj, logging.Logger):
-                continue
-            # Remove any handlers on the logger and let it propagate to root
+            elapsed = time.time() - start
+            self.timings.setdefault(name, []).append(elapsed)
             try:
-                logger_obj.handlers.clear()
-                logger_obj.propagate = True
+                logging.debug(f"[profiler] {name}: {elapsed:.6f}s")
             except Exception:
                 pass
-    except Exception:
-        # Non-fatal; best-effort
-        pass
+
+# Global profiler instance used throughout the module
+profiler = PerformanceProfiler()
     
-    # Force flush
-    logging.info("=== Pano2Stereo Optimized Processing Started ===")
-    for handler in root_logger.handlers:
-        handler.flush()
-
-def get_stream_resolution(url):
-    """Get resolution from video stream"""
-    try:
-        cap = cv2.VideoCapture(url)
-        if not cap.isOpened():
-            raise ValueError(f"Cannot open video stream: {url}")
-        
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        
-        cap.release()
-        
-        logging.info(f"Stream resolution: {width}x{height}, FPS: {fps}")
-        return width, height, fps
-    except Exception as e:
-        logging.error(f"Failed to get stream resolution: {e}")
-        raise
-
-class Pano2stereo():
-    def __init__(self, IPD, pro_radius, pixel, critical_depth, url):
-        logging.info('Initializing Pano2stereo Generator...')
+class Pano2stereo:
+    def __init__(self, IPD, pro_radius, pixel, critical_depth, url, red_cyan=True, max_frames=None):
+        # Store configuration
         self.IPD = IPD
-        self.width = None
-        self.height = None
         self.pro_radius = pro_radius
         self.pixel = pixel
         self.critical_depth = critical_depth
         self.device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
+        self.stream_redcyan = red_cyan
+
+        # Prepare output directory and urls
         self.outputdir = self.make_output_dir()
         self.url = url
         self.target_url = 'rtsp://10.20.35.30:28552/result'
         self.running = True
         self.save_result = False
-        
-        # Initialize RTSP streaming
+
+        # Initialize RTSP streaming placeholders
         self.stream_process = None
         self.stream_fps = 30  # Default FPS for streaming
-        # Note: RTSP streaming will be initialized after getting dimensions from FlashDepth
-        
-        # Load model
+
+        # Load model (FlashDepth)
         logging.info("Initializing FlashDepth model...")
-        self.flashdepth_processor = FlashDepthProcessor(config_path="configs/flashdepth.yaml", url=self.url, stream_mode=True, save_depth_png=False, save_frame=False, max_frames=20, run_dir=self.outputdir)
-        
+        self.flashdepth_processor = FlashDepthProcessor(config_path="configs/flashdepth.yaml", url=self.url, stream_mode=True, save_depth_png=False, save_frame=False, max_frames=max_frames, run_dir=self.outputdir)
+
         # Start FlashDepth inference in a separate thread
         self.inference_thread = threading.Thread(target=self.flashdepth_processor.run_inference, daemon=True)
         self.inference_thread.start()
         logging.info('[FlashDepth] Inference thread started in Pano2stereo.__init__')
-        
-        # Catch width and height from FlashdepthProcessor
-        logging.info("Waiting for FlashDepth inference to start...")
-        # Wait for FlashDepth processor to initialize pred
+
+        # Wait for FlashDepth to produce an initial prediction and read resolution
+        logging.info("[Pano2stereo] Waiting for FlashDepth inference to start...")
         while self.flashdepth_processor.pred is None:
-            time.sleep(0.02)  # Wait 20ms for inference to start
-                
-        # self.pred = [depth_pred, original_frame]  # Store latest depth map & frame（Tensor, shape [H, W, C] in BGR)
+            time.sleep(0.02)
+
+        # Read inferred resolution
         self.height = self.flashdepth_processor.pred[0].shape[0]
         self.width = self.flashdepth_processor.pred[0].shape[1]
-        logging.info(f"Got Input resolution from FlashDepth: {self.width}x{self.height}")
-        
-        # Now initialize RTSP streaming with correct dimensions
+        logging.info(f"[Pano2stereo] Got Input resolution from FlashDepth: {self.width}x{self.height}")
+
+        # Initialize streaming pipeline now that dimensions are known
         self._init_streaming()
 
-        # Precompute all required coordinate transformations
-        logging.info("Precomputing sphere coordinates...")
+        # Precompute sphere coordinates for forward mapping
+        logging.info("[Pano2stereo] Precomputing sphere coordinates...")
         self.sphere_coords = self._precompute_sphere_coords(self.width, self.height)  # (r, theta, phi) for [H,W] resolution, shape [H, W, 3]
 
         logging.info('[Pano2stereo] Initialization completed')
@@ -316,9 +218,19 @@ class Pano2stereo():
     def _init_streaming(self):
         """Initialize RTSP streaming pipeline"""
         try:
-            # Calculate output resolution (left + right images side by side)
-            output_width = self.width * 2
-            output_height = self.height
+            # Calculate output resolution
+            if self.stream_redcyan:
+                output_width = self.width
+                output_height = self.height
+                logging.info('[Streaming Init] Streaming Red-cyan (single view)')
+            else:
+                output_width = self.width * 2
+                output_height = self.height
+                logging.info('[Streaming Init] Streaming Left-Right Pano (side-by-side)')
+
+            # Record the stream resolution for later use in stream_frame
+            self.stream_width = int(output_width)
+            self.stream_height = int(output_height)
             
             # ffmpeg command for RTSP streaming
             # Low-latency friendly ffmpeg options; keep rawvideo RGB24 input from stdin
@@ -344,8 +256,8 @@ class Pano2stereo():
                 self.target_url
             ]
             
-            logging.info(f"Initializing RTSP stream to {self.target_url}")
-            logging.info(f"Stream resolution: {output_width}x{output_height} @ {self.stream_fps}fps")
+            logging.info(f"[Streaming Init] Initializing RTSP stream to {self.target_url}")
+            logging.info(f"[Streaming Init] Stream resolution: {output_width}x{output_height} @ {self.stream_fps}fps")
 
             # Start ffmpeg process and capture stderr for diagnostics
             # Prepare per-run stream directory and ffmpeg debug log file
@@ -399,41 +311,42 @@ class Pano2stereo():
 
                 # Write frame to ffmpeg stdin
                 try:
-                    # Validate expected frame size: height x (width*2) x 3
-                    expected_h = getattr(self, 'height', None)
-                    expected_w = getattr(self, 'width', None)
-                    if expected_h is not None and expected_w is not None:
-                            expected_shape = (expected_h, expected_w * 2, 3)
-                            if frame.shape != expected_shape:
-                                logging.warning(f"Frame shape mismatch: got {frame.shape}, expected {expected_shape}.")
-                                # Try to derive new dimensions from incoming frame
-                                new_h, new_w_total = frame.shape[0], frame.shape[1]
-                                # If width is even, assume side-by-side stereo (two halves)
-                                if new_w_total % 2 == 0:
-                                    new_w = new_w_total // 2
-                                else:
-                                    new_w = None
+                    # Validate expected frame size using recorded stream resolution (self.stream_width/height)
+                    expected_shape = (self.height, self.width * (1 if self.stream_redcyan else 2), 3)
+                    if frame.shape != expected_shape:
+                        logging.warning(f"Frame shape mismatch: got {frame.shape}, expected {expected_shape}.")
+                        # Try to derive new dimensions from incoming frame
+                        new_h, new_w_total = frame.shape[0], frame.shape[1]
+                        # If width is even, assume side-by-side stereo (two halves)
+                        if new_w_total % 2 == 0:
+                            new_w = new_w_total // 2
+                        else:
+                            new_w = None
 
-                                # If difference is small, just resize to expected shape and continue streaming
-                                if new_w is not None and abs(new_h - expected_h) <= 8 and abs(new_w - expected_w) <= 8:
-                                    logging.info(f"Resizing minor-mismatch frame {frame.shape} -> {expected_shape}")
-                                    try:
-                                        frame = cv2.resize(frame, (expected_w * 2, expected_h), interpolation=cv2.INTER_LINEAR)
-                                    except Exception as e:
-                                        logging.error(f"Failed to resize frame: {e}. Skipping frame.")
-                                        return
-                                else:
-                                    # Significant change: resize frame to match current stream resolution
-                                    if new_w is not None:
-                                        logging.info(f"Resizing significant-mismatch frame {frame.shape} -> {expected_shape}")
-                                        try:
-                                            frame = cv2.resize(frame, (expected_w * 2, expected_h), interpolation=cv2.INTER_LINEAR)
-                                        except Exception as e:
-                                            logging.error(f"Failed to resize frame: {e}. Skipping frame.")
-                                            return
-                                    else:
-                                        logging.error("Incoming frame width is odd; cannot split into two views. Skipping frame.")
-                                        return
+                        # Compute target width/height for resize (use recorded stream dims)
+                        target_h = expected_shape[0]
+                        target_w = expected_shape[1]
+
+                        # If difference is small, just resize to expected shape and continue streaming
+                        if new_w is not None and abs(new_h - target_h) <= 8 and abs(new_w - (target_w // (1 if self.stream_redcyan else 2))) <= 8:
+                            logging.info(f"Resizing minor-mismatch frame {frame.shape} -> {expected_shape}")
+                            try:
+                                frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+                            except Exception as e:
+                                logging.error(f"Failed to resize frame: {e}. Skipping frame.")
+                                return
+                        else:
+                            # Significant change: resize frame to match current stream resolution
+                            if new_w is not None:
+                                logging.info(f"Resizing significant-mismatch frame {frame.shape} -> {expected_shape}")
+                                try:
+                                    frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+                                except Exception as e:
+                                    logging.error(f"Failed to resize frame: {e}. Skipping frame.")
+                                    return
+                            else:
+                                logging.error("Incoming frame width is odd; cannot split into two views reliably. Skipping frame.")
+                                return
                     data = frame.tobytes()
                     logging.debug(f"Writing frame to ffmpeg stdin: bytes={len(data)}, expected={frame.size}")
                     self.stream_process.stdin.write(data)
@@ -715,39 +628,186 @@ class Pano2stereo():
         mask_right_unmapped = (count_buf_r.reshape((self.height, self.width)) == 0)
         self._last_masks = (mask_left_unmapped, mask_right_unmapped)
 
+        # Also record coordinates (row=y, col=x) of unmapped pixels as CuPy arrays
+        # nonzero returns (ys, xs)
+        ys_l, xs_l = cp.nonzero(mask_left_unmapped)
+        ys_r, xs_r = cp.nonzero(mask_right_unmapped)
+        self._last_unmapped_coords = ((ys_l, xs_l), (ys_r, xs_r))
+
         return left, right
 
-    @staticmethod
-    def repair_black_regions(image):
-        """Fast black region repair (GPU-optimized)"""
-        if not PARAMS["ENABLE_REPAIR"]:
-            return cp.asnumpy(image)
-        
-        # Keep data on GPU as much as possible
-        image_gpu = cp.asarray(image, dtype=cp.float32)
-        
-        # Convert to grayscale on GPU (RGB to grayscale: 0.299*R + 0.587*G + 0.114*B)
-        if image_gpu.shape[-1] == 3:  # RGB image
-            gray_gpu = cp.dot(image_gpu[..., :3], cp.array([0.299, 0.587, 0.114], dtype=cp.float32))
-        else:
-            gray_gpu = image_gpu
-        
-        # Count black pixels on GPU
-        black_pixels = cp.sum(gray_gpu == 0)
-        total_pixels = gray_gpu.size
-        
-        if black_pixels < total_pixels * 0.01:  # If black pixels less than 1%, skip repair
-            return cp.asnumpy(image_gpu.astype(cp.uint8))
-        
-        # For repair, we need to move to CPU as cv2.inpaint doesn't have GPU support
-        # But minimize the transfer by only transferring when repair is actually needed
-        image_cpu = cp.asnumpy(image_gpu.astype(cp.uint8))
-        
-        # Use faster repair algorithm on CPU
-        img_bgr = cv2.cvtColor(image_cpu, cv2.COLOR_RGB2BGR)
-        mask = np.uint8(cv2.cvtColor(image_cpu, cv2.COLOR_RGB2GRAY) == 0) * 255
-        repaired = cv2.inpaint(img_bgr, mask, inpaintRadius=2, flags=cv2.INPAINT_NS)
-        return cv2.cvtColor(repaired, cv2.COLOR_BGR2RGB)
+    def repair_black_regions(self, image, side='both'):
+        """Repair unmapped (black) regions using recorded self._last_unmapped_coords.
+
+        Strategy:
+        - If `self._last_unmapped_coords` exists use a GPU-local fill: for each unmapped pixel,
+          replace its RGB with the mean of valid neighbouring pixels within a small window (e.g. 3x3).
+        - If GPU path fails or CuPy is unavailable, fall back to the previous CPU-based OpenCV inpaint.
+
+        Arguments:
+            image: array-like RGB image (can be CuPy or NumPy)
+            side: 'left', 'right' or 'both' to indicate which image's unmapped coords to use.
+
+        Returns:
+            Repaired image as NumPy array (uint8, RGB)
+        """
+        if not PARAMS.get("ENABLE_REPAIR", True):
+            # Return NumPy array for consistency
+            return cp.asnumpy(image) if 'cp' in globals() and isinstance(image, cp.ndarray) else np.asarray(image)
+
+        # Prefer GPU path: use distance-transform nearest-neighbor remap when cupyx supports it
+        try:
+            if 'cp' not in globals() or not isinstance(image, cp.ndarray):
+                image_gpu = cp.asarray(image, dtype=cp.uint8)
+            else:
+                image_gpu = image.astype(cp.uint8)
+
+            H, W = image_gpu.shape[0], image_gpu.shape[1]
+
+            # Determine which sides to repair: build fill mask from recorded coords
+            coords = None
+            if hasattr(self, '_last_unmapped_coords') and self._last_unmapped_coords is not None:
+                if side == 'left':
+                    coords = self._last_unmapped_coords[0]
+                elif side == 'right':
+                    coords = self._last_unmapped_coords[1]
+                else:
+                    ys_l, xs_l = self._last_unmapped_coords[0]
+                    ys_r, xs_r = self._last_unmapped_coords[1]
+                    ys = cp.concatenate([ys_l, ys_r])
+                    xs = cp.concatenate([xs_l, xs_r])
+                    coords = (ys, xs)
+
+            if coords is None or len(coords) != 2:
+                raise RuntimeError("No unmapped coords available for repair; falling back to CPU inpaint")
+
+            ys, xs = coords
+
+            # Build fill mask (True where we need to fill)
+            fill_mask = cp.zeros((H, W), dtype=cp.bool_)
+            if ys.size > 0:
+                fill_mask[ys, xs] = True
+            if not fill_mask.any():
+                # nothing to fill
+                return cp.asnumpy(image_gpu.astype(cp.uint8))
+
+            # Valid pixels are those with any non-zero channel
+            valid_mask = cp.any(image_gpu != 0, axis=-1)
+
+            # If there are no valid pixels, fallback
+            if not valid_mask.any():
+                raise RuntimeError("No valid pixels available to sample from; falling back to CPU inpaint")
+
+            # Use cupyx distance transform to compute nearest valid pixel indices
+            try:
+                from cupyx.scipy.ndimage import distance_transform_edt
+                # distance_transform_edt expects background==0; compute for valid_mask==False
+                # We request indices of nearest non-zero (i.e. valid) locations
+                dist, indices = distance_transform_edt(~valid_mask, return_indices=True)
+                # indices shape is (ndim, H, W)
+                idx_y = indices[0].astype(cp.int32)
+                idx_x = indices[1].astype(cp.int32)
+
+                # Remap entire image from nearest valid indices
+                remapped = image_gpu[idx_y, idx_x]
+
+                # Only replace fill_mask pixels
+                out = image_gpu.copy()
+                out[fill_mask] = remapped[fill_mask]
+
+                return cp.asnumpy(out.astype(cp.uint8))
+            except Exception as e_dist:
+                # If cupyx distance transform not available or fails, raise to trigger CPU fallback
+                raise RuntimeError(f"cupyx distance_transform_edt failed: {e_dist}")
+
+        except Exception as e:
+            logging.warning(f"GPU repair path failed or unavailable ({e}), falling back to CPU inpaint")
+
+            # CPU fallback: use previous inpaint approach on full image
+            image_cpu = cp.asnumpy(image).astype(np.uint8) if 'cp' in globals() and isinstance(image, cp.ndarray) else np.asarray(image).astype(np.uint8)
+            img_bgr = cv2.cvtColor(image_cpu, cv2.COLOR_RGB2BGR)
+
+            # If _last_unmapped_coords exist, construct mask from them; otherwise detect black pixels
+            mask = None
+            try:
+                if hasattr(self, '_last_unmapped_coords') and self._last_unmapped_coords is not None:
+                    ys_l, xs_l = cp.asnumpy(self._last_unmapped_coords[0])
+                    ys_r, xs_r = cp.asnumpy(self._last_unmapped_coords[1])
+                    ys = np.concatenate([ys_l, ys_r]).astype(np.int32)
+                    xs = np.concatenate([xs_l, xs_r]).astype(np.int32)
+                    mask = np.zeros((image_cpu.shape[0], image_cpu.shape[1]), dtype=np.uint8)
+                    mask[ys, xs] = 255
+                else:
+                    mask = np.uint8(cv2.cvtColor(image_cpu, cv2.COLOR_RGB2GRAY) == 0) * 255
+            except Exception:
+                mask = np.uint8(cv2.cvtColor(image_cpu, cv2.COLOR_RGB2GRAY) == 0) * 255
+
+            if np.sum(mask) == 0:
+                # Nothing to repair
+                return image_cpu
+
+            repaired = cv2.inpaint(img_bgr, mask, inpaintRadius=2, flags=cv2.INPAINT_NS)
+            return cv2.cvtColor(repaired, cv2.COLOR_BGR2RGB)
+
+    def repair_black_regions_pair(self, left, right):
+        """Repair left and right images in a single combined call.
+
+        This concatenates left and right horizontally (keeping on GPU when possible),
+        runs the GPU-preferred repair once (distance transform remap), then splits
+        and returns the repaired left and right images. This avoids duplicated
+        distance-transform / remap work when both views share the same valid pixels.
+        """
+        # Convert inputs to CuPy if available to prefer GPU path
+        left_gpu = cp.asarray(left) if not isinstance(left, cp.ndarray) else left
+        right_gpu = cp.asarray(right) if not isinstance(right, cp.ndarray) else right
+
+        # Concatenate horizontally (W_left + W_right)
+        try:
+            combined = cp.concatenate([left_gpu, right_gpu], axis=1)
+            combined_repaired = None
+
+            # Try to reuse existing repair_black_regions code path by passing side='both'
+            # but operate directly on the concatenated image. We temporarily set
+            # _last_unmapped_coords to combined coords so the method will build a fill mask correctly.
+            # Build combined unmapped coords from existing per-eye coords if present
+            if hasattr(self, '_last_unmapped_coords') and self._last_unmapped_coords is not None:
+                (ys_l, xs_l), (ys_r, xs_r) = self._last_unmapped_coords
+                # shift right xs by left width
+                shift = left_gpu.shape[1]
+                xs_r_shifted = xs_r + int(shift)
+                ys = cp.concatenate([ys_l, ys_r])
+                xs = cp.concatenate([xs_l, xs_r_shifted])
+                # Temporarily override
+                orig_coords = self._last_unmapped_coords
+                self._last_unmapped_coords = ( (ys, xs), (cp.array([], dtype=cp.int32), cp.array([], dtype=cp.int32)) )
+            else:
+                orig_coords = None
+
+            try:
+                combined_repaired = self.repair_black_regions(combined, side='both')
+            finally:
+                # restore original coords
+                if orig_coords is not None:
+                    self._last_unmapped_coords = orig_coords
+
+            # combined_repaired returned as numpy uint8; convert back to cupy if needed then split
+            if isinstance(combined_repaired, np.ndarray):
+                combined_np = combined_repaired
+            else:
+                combined_np = cp.asnumpy(combined_repaired)
+
+            w_left = left.shape[1] if not isinstance(left, cp.ndarray) else left_gpu.shape[1]
+            left_out = combined_np[:, :w_left, :]
+            right_out = combined_np[:, w_left:, :]
+
+            # return as CuPy arrays to keep consistency with pipeline (main expects cp arrays)
+            return cp.asarray(left_out), cp.asarray(right_out), combined_np
+
+        except Exception:
+            # Fallback: run repair separately (safer but slower)
+            left_r = self.repair_black_regions(left, side='left')
+            right_r = self.repair_black_regions(right, side='right')
+            return cp.asarray(left_r), cp.asarray(right_r)
 
     def make_output_dir(self, base_dir='output'):
         """Create output directory under a parent folder as run_XXX.
@@ -860,96 +920,90 @@ class Pano2stereo():
 
 # =============== Optimized Utility Functions ===============
 
-def load_and_resize_image(img_path):
-    """Load and optionally resize image to improve speed"""
-    if not os.path.exists(img_path):
-        raise FileNotFoundError(f"File Not Found: {img_path}")
-    
-    bgr_array = cv2.imread(img_path, cv2.IMREAD_COLOR)
-    if bgr_array is None:
-        raise FileNotFoundError(f"Cannot Read file: {img_path}")
-    
-    rgb_array = cv2.cvtColor(bgr_array, cv2.COLOR_BGR2RGB)
-    
-    # Optional: Resize image to improve processing speed
-    original_height, original_width = rgb_array.shape[:2]
-    if (PARAMS.get("TARGET_HEIGHT") and PARAMS.get("TARGET_WIDTH") and 
-        (original_height > PARAMS["TARGET_HEIGHT"] or original_width > PARAMS["TARGET_WIDTH"])):
-        
-        rgb_array = cv2.resize(rgb_array, (PARAMS["TARGET_WIDTH"], PARAMS["TARGET_HEIGHT"]))
-        logging.info(f"Image resized from {original_width}x{original_height} to {PARAMS['TARGET_WIDTH']}x{PARAMS['TARGET_HEIGHT']}")
-    
-    logging.info(f"Input Image: {img_path}")
-    logging.info(f"Image Size: {rgb_array.shape[1]}x{rgb_array.shape[0]}")
-    return rgb_array
-
-def save_results_optimized(left, right, left_repaired, right_repaired, depth, output_dir):
-    """Optimized result saving"""
-    # Save multiple images in parallel
-    def save_image(img, path, is_gpu=True):
-        if is_gpu and hasattr(img, 'get'):
-            img = img.get()
-        elif is_gpu:
-            img = cp.asnumpy(img)
-        
-        if len(img.shape) == 3 and img.shape[2] == 3:  # RGB image
-            img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(str(path), img_bgr)
-        else:
-            cv2.imwrite(str(path), img)
-    
-    output_path = Path(output_dir)
-    
-    # Save main images
-    save_image(left, output_path / "left.png")
-    save_image(right, output_path / "right.png")
-    save_image(left_repaired, output_path / "left_repaired.png", is_gpu=False)
-    save_image(right_repaired, output_path / "right_repaired.png", is_gpu=False)
-    
-    # Fix depth map saving, eliminate warnings
+def logging_setup(log_file: str = 'logs/pano2stereo.log'):
+    """Ensure logging is configured (idempotent). Call at program start."""
     try:
-        # Correctly get depth data
-        if hasattr(depth, 'get'):
-            depth_cpu = depth.get()
-        elif isinstance(depth, cp.ndarray):
-            depth_cpu = cp.asnumpy(depth)
-        else:
-            depth_cpu = depth
-        
-        # Ensure numpy array
-        if not isinstance(depth_cpu, np.ndarray):
-            depth_cpu = np.array(depth_cpu)
-        
-        # Correctly handle depth map data type and range
-        if depth_cpu.dtype != np.uint8:
-            # Get valid depth values (exclude inf and nan)
-            valid_mask = np.isfinite(depth_cpu)
-            if np.any(valid_mask):
-                depth_min = np.min(depth_cpu[valid_mask])
-                depth_max = np.max(depth_cpu[valid_mask])
-                
-                # Normalize to 0-255 range
-                if depth_max > depth_min:
-                    depth_normalized = np.zeros_like(depth_cpu, dtype=np.uint8)
-                    depth_normalized[valid_mask] = ((depth_cpu[valid_mask] - depth_min) / 
-                                                   (depth_max - depth_min) * 255).astype(np.uint8)
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    except Exception:
+        pass
+    # Reconfigure root logger handlers if not already configured
+    root = logging.getLogger()
+    if not any(isinstance(h, logging.FileHandler) for h in root.handlers):
+        root.setLevel(logging.INFO)
+        fh = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+        fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(module)s:%(lineno)d - %(message)s'))
+        sh = logging.StreamHandler()
+        sh.setFormatter(logging.Formatter('%(levelname)s - %(message)s'))
+        root.addHandler(fh)
+        root.addHandler(sh)
+
+
+def save_results_visualization(left, right, left_repaired, right_repaired, depth, output_dir, pano_repair=None, frame_idx=None, generator=None):
+    """Optimized result saving (extended signature).
+
+    This function preserves previous behavior but also saves the stitched
+    `pano_repair` if provided, and can call stereoscopy.create_anaglyph when
+    requested via PARAMS["ENABLE_RED_CYAN"].
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    def _to_numpy(x):
+        if 'cp' in globals() and isinstance(x, cp.ndarray):
+            return cp.asnumpy(x)
+        return np.asarray(x)
+
+    try:
+        left_np = _to_numpy(left)
+        right_np = _to_numpy(right)
+        left_rep_np = _to_numpy(left_repaired)
+        right_rep_np = _to_numpy(right_repaired)
+
+        # Save images
+        cv2.imwrite(str(output_path / f"left_{frame_idx:03d}.png" if frame_idx is not None else output_path / "left.png"), cv2.cvtColor(left_np, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(str(output_path / f"right_{frame_idx:03d}.png" if frame_idx is not None else output_path / "right.png"), cv2.cvtColor(right_np, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(str(output_path / f"left_repaired_{frame_idx:03d}.png" if frame_idx is not None else output_path / "left_repaired.png"), cv2.cvtColor(left_rep_np, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(str(output_path / f"right_repaired_{frame_idx:03d}.png" if frame_idx is not None else output_path / "right_repaired.png"), cv2.cvtColor(right_rep_np, cv2.COLOR_RGB2BGR))
+
+        # Save stitched pano_repair if available
+        if pano_repair is not None:
+            pano_np = _to_numpy(pano_repair)
+            cv2.imwrite(str(output_path / f"stereo_{frame_idx:03d}.png" if frame_idx is not None else output_path / "stereo.png"), cv2.cvtColor(pano_np, cv2.COLOR_RGB2BGR))
+
+        # Optional red-cyan generation (GPU-first using gpu_create_anaglyph)
+        if PARAMS.get("ENABLE_RED_CYAN", False) and generator is not None:
+            try:
+                anaglyph_np = gpu_create_anaglyph(left_rep_np, right_rep_np)
+                anaglyph_path = output_path / (f"red_cyan_{frame_idx:03d}.png" if frame_idx is not None else "red_cyan.png")
+                if anaglyph_np is not None:
+                    try:
+                        cv2.imwrite(str(anaglyph_path), cv2.cvtColor(anaglyph_np, cv2.COLOR_RGB2BGR))
+                        logging.info(f"Saved GPU red-cyan anaglyph: {anaglyph_path.name}")
+                    except Exception as e:
+                        logging.warning(f"Failed to write GPU anaglyph to disk: {e}")
                 else:
-                    depth_normalized = np.zeros_like(depth_cpu, dtype=np.uint8)
-            else:
-                depth_normalized = np.zeros_like(depth_cpu, dtype=np.uint8)
-        else:
-            depth_normalized = depth_cpu.astype(np.uint8)
-        
-        # Save depth map (now correct uint8 format)
-        cv2.imwrite(str(output_path / 'depth.png'), depth_normalized)
-        
-        if 'valid_mask' in locals() and np.any(valid_mask):
-            logging.info(f"Depth map saved (range: {depth_min:.3f}-{depth_max:.3f}m → 0-255)")
-        else:
-            logging.info("Depth map saved (uint8 format)")
-            
+                    # Fallback to stereoscopy if GPU routine returned None
+                    try:
+                        left_img = Image.fromarray(left_rep_np.astype(np.uint8))
+                        right_img = Image.fromarray(right_rep_np.astype(np.uint8))
+                        anaglyph = stereoscopy.create_anaglyph([left_img, right_img], method="color", color_scheme="red-cyan", luma_coding="rgb")
+                        anaglyph.save(str(output_path / f"red_cyan_{frame_idx:03d}.png" if frame_idx is not None else output_path / "red_cyan.png"))
+                    except Exception as e:
+                        logging.warning(f"Fallback stereoscopy anaglyph generation failed: {e}")
+            except Exception as e:
+                logging.warning(f"GPU red-cyan generation failed in save_results_visualization: {e}")
+
+        # Save depth visualization using the centralized helper to keep behavior consistent
+        try:
+            # Use the same stereo_dir/output_path and frame index semantics
+            stereo_dir = output_path
+            # call the helper which will handle CuPy/NumPy conversion and colorbar
+            save_depth_visualization(depth, stereo_dir, frame_idx if frame_idx is not None else 0, generator, getattr(generator, 'critical_depth', PARAMS.get('CRITICAL_DEPTH', 9999)))
+        except Exception as e:
+            logging.warning(f"Failed to save depth via save_depth_visualization: {e}")
+
     except Exception as e:
-        logging.warning(f"Depth map save failed: {e}")
+        logging.warning(f"save_results_optimized failed: {e}")
 
 
 def save_depth_visualization(depth, stereo_dir, frame_count, generator, critical_depth):
@@ -1042,109 +1096,67 @@ def save_depth_visualization(depth, stereo_dir, frame_count, generator, critical
             # combined: left gray_rgb, right cb_rgb
             top_bar_pixel = combined[0, gray_rgb.shape[1] // 2, 0] if combined.shape[1] > gray_rgb.shape[1] else combined[0, 0, 0]
             bottom_bar_pixel = combined[-1, gray_rgb.shape[1] // 2, 0] if combined.shape[1] > gray_rgb.shape[1] else combined[-1, 0, 0]
-            logging.info(f"Depth->gray mapping: 0.0 -> black (0), {critical} -> white (255). Colorbar endpoints (top,bottom) pixel values: ({int(top_bar_pixel)},{int(bottom_bar_pixel)})")
+            # logging.info(f"Depth->gray mapping: 0.0 -> black (0), {critical} -> white (255). Colorbar endpoints (top,bottom) pixel values: ({int(top_bar_pixel)},{int(bottom_bar_pixel)})")
         except Exception:
             pass
 
         cv2.imwrite(str(depth_gray_path), cv2.cvtColor(combined, cv2.COLOR_RGB2BGR))
-        logging.info(f"Saved depth visualization (gray+colorbar): {depth_gray_path.name}")
+        # logging.info(f"Saved depth visualization (gray+colorbar): {depth_gray_path.name}")
     except Exception as e:
         logging.warning(f"Failed to save depth visualization: {e}")
 
 
-def estimate_depth_optimized(generator, rgb_array):
-    """Optimized depth estimation (using FlashDepth)"""
-    # Convert RGB image to torch tensor
-    if isinstance(rgb_array, np.ndarray):
-        rgb_tensor = torch.from_numpy(rgb_array).permute(2, 0, 1).unsqueeze(0).float() / 255.0
-    else:
-        rgb_tensor = rgb_array
-    rgb_tensor = rgb_tensor.to(generator.device)
-    
-    # Use FlashDepthProcessor for inference
-    # Assume FlashDepthProcessor has process_single_image method
-    depth = generator.flashdepth_processor.process_single_image(rgb_tensor)
-    
-    # Update self.depth
-    generator.flashdepth_processor.depth = depth
-    
-    return cp.asarray(depth.cpu().numpy(), dtype=cp.float32)
+def gpu_create_anaglyph(left_img, right_img):
+    """Create a red-cyan anaglyph on GPU using CuPy.
 
-def post_process_optimized(output_dir, width, height):
-    """Optimized post-processing (optional red-cyan 3D function)"""
-    if not PARAMS["ENABLE_POST_PROCESS"]:
-        logging.info("Post-processing disabled for speed")
-        return
-        
-    output_dir = Path(output_dir).absolute()
+    Simple color anaglyph approximation:
+      - output R = left.R
+      - output G = right.G * 0.0 (we set from right) or mix
+      - output B = right.B
+
+    left_img/right_img may be NumPy arrays or CuPy arrays. Returns a NumPy uint8 RGB image.
+    """
     try:
-        # Optional: Generate red-cyan 3D image
-        if PARAMS["ENABLE_RED_CYAN"]:
-            # Prefer using the stereoscopy Python API (faster, no subprocess)
-            try:
-                left_path = output_dir / "left_repaired.png"
-                right_path = output_dir / "right_repaired.png"
-
-                left_img = Image.open(str(left_path)).convert('RGB')
-                right_img = Image.open(str(right_path)).convert('RGB')
-
-                # create_anaglyph expects a list of two PIL images
-                anaglyph = stereoscopy.create_anaglyph([left_img, right_img], method="color", color_scheme="red-cyan", luma_coding="rgb")
-                anaglyph.save(str(output_dir / "red_cyan.png"))
-                logging.info("Red-cyan 3D image generated (via stereoscopy package)")
-            except Exception as e:
-                logging.warning(f"stereoscopy package failed or not available: {e}; falling back to StereoscoPy subprocess")
-                try:
-                    subprocess.run([
-                        "StereoscoPy",
-                        "-S", "5", "0",
-                        "-a",
-                        "-m", "color",
-                        "--cs", "red-cyan",
-                        "--lc", "rgb",
-                        str(output_dir / "left_repaired.png"),
-                        str(output_dir / "right_repaired.png"),
-                        str(output_dir / "red_cyan.png")
-                    ], check=True, capture_output=True)
-                    logging.info("Red-cyan 3D image generated (via subprocess StereoscoPy)")
-                except subprocess.CalledProcessError as e:
-                    logging.error(f"Red-cyan generation failed (subprocess): {e.returncode}")
+        # Ensure on GPU
+        if 'cp' in globals() and isinstance(left_img, cp.ndarray):
+            l_gpu = left_img.astype(cp.uint8)
         else:
-            logging.info("Red-cyan 3D generation skipped (disabled for speed)")
+            l_gpu = cp.asarray(left_img, dtype=cp.uint8)
 
-        # Generate left-right stitched stereo image
-        subprocess.run([
-            "ffmpeg", "-y", "-loglevel", "error",  # Reduce log output
-            "-i", str(output_dir / "left_repaired.png"),
-            "-i", str(output_dir / "right_repaired.png"),
-            "-filter_complex", f"[0:v][1:v]hstack", 
-            "-frames:v", "1", 
-            str(output_dir / "stereo.jpg")
-        ], check=True, capture_output=True)
+        if 'cp' in globals() and isinstance(right_img, cp.ndarray):
+            r_gpu = right_img.astype(cp.uint8)
+        else:
+            r_gpu = cp.asarray(right_img, dtype=cp.uint8)
 
-        # Optional: Generate video
-        if PARAMS["GENERATE_VIDEO"]:
-            logging.info("Generating video...")
-            subprocess.run([
-                "ffmpeg", "-y", "-loglevel", "error",
-                "-loop", "1",
-                "-i", str(output_dir / "stereo.jpg"),
-                "-c:v", "libx264",
-                "-t", "60",
-                "-pix_fmt", "yuv420p",
-                "-vf", "fps=30",
-                str(output_dir / "stereo_output.mp4")
-            ], check=True, capture_output=True)
+        # Ensure shape and channels
+        if l_gpu.ndim == 2:
+            l_gpu = cp.stack([l_gpu, l_gpu, l_gpu], axis=-1)
+        if r_gpu.ndim == 2:
+            r_gpu = cp.stack([r_gpu, r_gpu, r_gpu], axis=-1)
 
-    except subprocess.CalledProcessError as e:
-        logging.error(f"Post-process failure: {e.returncode}")
+        # Compose anaglyph: R from left, G and B from right
+        out_gpu = cp.empty_like(l_gpu)
+        out_gpu[..., 0] = l_gpu[..., 0]
+        # For a slightly better perceptual result, mix right green with left green a bit
+        out_gpu[..., 1] = r_gpu[..., 1]
+        out_gpu[..., 2] = r_gpu[..., 2]
+
+        # Transfer back to CPU for saving
+        out_np = cp.asnumpy(out_gpu)
+        return out_np.astype(np.uint8)
     except Exception as e:
-        logging.error(f"Post-process error: {str(e)}")
-    else:
-        red_cyan_status = "with red-cyan 3D" if PARAMS["ENABLE_RED_CYAN"] else "without red-cyan 3D"
-        logging.info(f"Post-processing completed ({red_cyan_status})")
-    
-    logging.info(f"Output Dir: {output_dir}")
+        logging.warning(f"GPU anaglyph generation failed: {e}")
+        # Fallback to CPU composition
+        try:
+            l = np.asarray(left_img).astype(np.uint8)
+            r = np.asarray(right_img).astype(np.uint8)
+            out = np.zeros_like(l)
+            out[..., 0] = l[..., 0]
+            out[..., 1] = r[..., 1]
+            out[..., 2] = r[..., 2]
+            return out
+        except Exception:
+            return None
 
 # =============== Main Function ===============
 def main():
@@ -1177,11 +1189,13 @@ def main():
             pro_radius=PRO_RADIUS, 
             pixel=PIXEL, 
             critical_depth=CRITICAL_DEPTH, 
-            url=URL
+            url=URL,
+            red_cyan=True,
+            max_frames=200
         )
         
-        # Create stereo_img directory and initialize frame counter
-        stereo_dir = Path(generator.outputdir) / "stereo_img"
+        # Create visualization directory and initialize frame counter
+        stereo_dir = Path(generator.outputdir) / "visualization"
         stereo_dir.mkdir(parents=True, exist_ok=True)
         frame_count = 0
         
@@ -1204,102 +1218,52 @@ def main():
             # TODO: the physical meaning of depth = 100/x (m)?? 
             depth = generator.disparity_to_depth(disparity_map=depth, critical_depth=CRITICAL_DEPTH)  # Convert to meters and clamp
             
-            # Compute and log basic statistics for the depth map we just received.
-            try:
-                # depth may be a CuPy array or NumPy array; handle both
-                if 'cp' in globals() and isinstance(depth, cp.ndarray):
-                    # Move minimal statistics to CPU without copying entire array if possible
-                    # Use CuPy's reduction which is efficient on GPU
-                    # Filter out non-finite values
-                    finite_mask = cp.isfinite(depth)
-                    if cp.any(finite_mask):
-                        depth_min = float(cp.min(depth[finite_mask]).get())
-                        depth_max = float(cp.max(depth[finite_mask]).get())
-                        depth_mean = float(cp.mean(depth[finite_mask]).get())
-                    else:
-                        depth_min = float('nan')
-                        depth_max = float('nan')
-                        depth_mean = float('nan')
-                else:
-                    # Assume NumPy array-like
-                    import numpy as _np
-                    depth_np = _np.asarray(depth)
-                    finite_mask = _np.isfinite(depth_np)
-                    if _np.any(finite_mask):
-                        depth_min = float(_np.min(depth_np[finite_mask]))
-                        depth_max = float(_np.max(depth_np[finite_mask]))
-                        depth_mean = float(_np.mean(depth_np[finite_mask]))
-                    else:
-                        depth_min = float('nan')
-                        depth_max = float('nan')
-                        depth_mean = float('nan')
-                logging.info(f"Depth stats — min: {depth_min:.6g}, max: {depth_max:.6g}, mean: {depth_mean:.6g}")
-            except Exception as _e:
-                logging.warning(f"Failed to compute depth statistics: {_e}")
-
-            # Save depth visualization (gray + annotated colorbar)
-            save_depth_visualization(depth, stereo_dir, frame_count, generator, CRITICAL_DEPTH)
-            
             rgb = bgr[..., ::-1]  # Convert BGR to RGB
-            logging.info(f"Depth shape: {depth.shape}, RGB shape: {rgb.shape}")
+            logging.info(f"[MAIN LOOP] Depth shape: {depth.shape}, RGB shape: {rgb.shape}")
             # At this point we trust FlashDepth: rgb and depth are same resolution
             left, right = generator.generate_stereo_pair(rgb_data=rgb, depth_data=depth)
         
-            # 2.2 🔧 Image repair (core timing - parallel processing)
-            # Parallel repair of left and right images            
-            # Use thread pool for parallel processing of left and right images
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                # Submit left and right image repair tasks
-                future_left = executor.submit(generator.repair_black_regions, left)
-                future_right = executor.submit(generator.repair_black_regions, right)
-                
-                # Get results
-                left_repaired = future_left.result()
-                right_repaired = future_right.result()
+            # 2.2 🔧 Image repair (single combined call - GPU-friendly)
+            # Combine left and right repair into a single call to avoid duplicate GPU work
+            try:
+                left_repaired, right_repaired, pano_repair = generator.repair_black_regions_pair(left, right)
+            except Exception as e:
+                logging.warning(f"[MAIN LOOP] Combined repair failed, falling back to parallel repair: {e}")
+                # Fall back to previous behavior (parallel threads) if combined fails
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                    future_left = executor.submit(generator.repair_black_regions, left)
+                    future_right = executor.submit(generator.repair_black_regions, right)
+                    left_repaired = future_left.result()
+                    right_repaired = future_right.result()
+                    pano_repair = np.concatenate([left_repaired, right_repaired], axis=1)
 
             # Save and post-process (not participating in core timing)
-            if generator.save_result:
-                output_dir = generator.outputdir
-                save_results_optimized(left, right, left_repaired, right_repaired, depth, output_dir)
-                post_process_optimized(output_dir, generator.width, generator.height)
+            output_dir = Path(generator.outputdir) / (f"visualization/")
+            if (0) and (frame_count % 20 == 0):
+                save_results_visualization(left, right, left_repaired, right_repaired, depth, output_dir, pano_repair=pano_repair, frame_idx=frame_count, generator=generator)
 
+            # Optional: fast GPU-generated red-cyan anaglyph
+            anaglyph_np = gpu_create_anaglyph(left_repaired, right_repaired)
+            if (True) and (frame_count % 20 == 0):
+                anaglyph_path = Path(output_dir) / (f"red_cyan_{frame_count:03d}.png")
+                cv2.imwrite(str(anaglyph_path), cv2.cvtColor(anaglyph_np, cv2.COLOR_RGB2BGR))
+                logging.info(f"[MAIN LOOP] Saved GPU red-cyan anaglyph: {anaglyph_path.name}")
+            else:
+                logging.debug("[MAIN LOOP] GPU anaglyph generation returned None; skipping save")
+            
             # 2.3  Streaming
-            # Stream to target URL
-            stereo_image = np.hstack((cp.asnumpy(left_repaired), cp.asnumpy(right_repaired)))
-            logging.info(f"Streaming frame size: {stereo_image.shape[1]}x{stereo_image.shape[0]}")
+            if generator.stream_redcyan:         
+                # Stream red_cyan to target URL
+                logging.info(f"[MAIN LOOP] Streaming frame size: {anaglyph_np.shape[1]}x{anaglyph_np.shape[0]}")
+                generator.stream_frame(anaglyph_np)  
+            else:
+                # Stream Pano(left+right)to target URL
+                logging.info(f"[MAIN LOOP]Streaming frame size: {pano_repair.shape[1]}x{pano_repair.shape[0]}")
+                generator.stream_frame(pano_repair)  
             
-            # 2.4 Saving results
-
-            # Generate Red-Cyan anaglyph
-            # Convert left_repaired/right_repaired to CPU numpy arrays
-            left_np = cp.asnumpy(left_repaired)
-            right_np = cp.asnumpy(right_repaired)
-
-            # Convert to PIL Images and call stereoscopy API
-            left_img = Image.fromarray(left_np)
-            right_img = Image.fromarray(right_np)
-
-            anaglyph = stereoscopy.create_anaglyph([left_img, right_img], method="color", color_scheme="red-cyan", luma_coding="rgb")
-            red_cyan_path = stereo_dir / f"red_cyan_{frame_count:03d}.png"
-            anaglyph.save(str(red_cyan_path))
-
-            # red_cyan = np.zeros_like(left_repaired, dtype=np.uint8)
-            # red_cyan[:, :, 0] = left_repaired[:, :, 0]  # Red channel from left eye
-            # red_cyan[:, :, 1] = right_repaired[:, :, 1]  # Green channel from right eye
-            # red_cyan[:, :, 2] = right_repaired[:, :, 2]  # Blue channel from right eye
-            
-            # Save Red-Cyan anaglyph
-            # red_cyan_path = stereo_dir / f"red_cyan_{frame_count:03d}.png"
-            # cv2.imwrite(str(red_cyan_path), cv2.cvtColor(red_cyan, cv2.COLOR_RGB2BGR))
-            
-            # Save stereo_image to local before streaming
-            stereo_path = stereo_dir / f"stereo_{frame_count:03d}.png"
-            cv2.imwrite(str(stereo_path), cv2.cvtColor(stereo_image, cv2.COLOR_RGB2BGR))
-
+            # 2.4 Frame_count add
             frame_count += 1
-            # Stream the stereo image via RTSP
-            generator.stream_frame(stereo_image)
-            # generator.stream_frame(red_cyan_path)  # Stream the red-cyan image 
+            # generator.stream_frame(red_cyan)  # Stream the red-cyan image 
 
         # Memory cleanup
         del rgb, depth, left, right

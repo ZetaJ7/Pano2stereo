@@ -59,8 +59,8 @@ eval:
   out_mp4: false # mp4 if true, gif if false (default changed to false)
   save_res: 518
   save_depth_npy: false
-  save_depth_png: true
-  save_frame_png: true
+  save_depth_png: false
+  save_frame_png: false
   save_vis_map: false
   dummy_timing: false
   large_dir: null
