@@ -14,10 +14,6 @@ img_path: "Data/Lab3.jpg"          # 输入图片路径
 output_base: "output/stream"      # 输出目录基础名
 generate_video: false              # 是否生成视频文件
 
-# ============== 深度估计模型设置 ==============
-vit_size: "vits"                   # 深度模型类型: "vits"(最快), "vitb"(中等), "vitl"(最慢但最准确)
-dataset: "hypersim"                # 深度模型数据集: "hypersim" 或 "vkitti"
-
 # ============== 性能优化设置 ==============
 target_height: 540                 # 目标图像高度 (像素) - 降低以提升速度
 target_width: 960                  # 目标图像宽度 (像素) - 降低以提升速度

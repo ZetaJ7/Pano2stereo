@@ -304,13 +304,11 @@ class Pano2stereo():
         
         # Now initialize RTSP streaming with correct dimensions
         self._init_streaming()
-        
+
         # Precompute all required coordinate transformations
         logging.info("Precomputing sphere coordinates...")
-        self.sphere_coords = self._precompute_sphere_coords(self.width, self.height)
-        # Precompute grid coordinates for fast sampling
-        self.grid_y, self.grid_x = cp.meshgrid(cp.arange(self.height), cp.arange(self.width), indexing='ij')
-        
+        self.sphere_coords = self._precompute_sphere_coords(self.width, self.height)  # (r, theta, phi) for [H,W] resolution, shape [H, W, 3]
+
         logging.info('[Pano2stereo] Initialization completed')
 
 
@@ -510,19 +508,19 @@ class Pano2stereo():
             pass
 
     def _precompute_sphere_coords(self, image_width, image_height):
-        """Optimized spherical coordinate precomputation"""
+        """get spherical coordinates (r, theta, phi) for all pixels in (H,W) resolution, return shape [H, W, 3]"""
         # Use more efficient coordinate generation
         x = cp.linspace(0, image_width - 1, image_width, dtype=cp.float32)
         y = cp.linspace(0, image_height - 1, image_height, dtype=cp.float32)
         xx, yy = cp.meshgrid(x, y)
         
-        # Vectorized calculation
+        # Vectorized calculation of spherical coordinates
         u = (xx / (image_width - 1)) * 2 - 1
         v = (yy / (image_height - 1)) * -2 + 1
         lon = u * cp.pi
         lat = v * (cp.pi / 2)
         
-        # Spherical coordinates calculation
+        # Unit sphere to Cartesian coordinates
         x_xyz = cp.cos(lat) * cp.cos(lon)
         y_xyz = cp.cos(lat) * cp.sin(lon)
         z_xyz = cp.sin(lat)
@@ -534,15 +532,33 @@ class Pano2stereo():
         
         return cp.stack([r, theta, phi], axis=-1)
 
+    def sphere2pano_vectorized(self, depth_map):
+        """Original version of efficient spherical parallax calculation"""
+        with profiler.timer("Sphere2pano_vectorized"):
+            # Ensure depth_map is 2D
+            depth_map = cp.asarray(depth_map)
+            assert depth_map.ndim == 2, "depth_map must be 2D, got shape {}".format(depth_map.shape)
+            
+            R = cp.asarray(self.sphere_coords[..., 0])
+            theta = cp.asarray(self.sphere_coords[..., 1])
+            phi = cp.asarray(self.sphere_coords[..., 2])
+            mask = depth_map < self.critical_depth
+            ratio = cp.clip(self.IPD / cp.where(mask, depth_map, cp.inf), -1.0, 1.0)
+            delta = cp.arcsin(ratio)
+            phi_l = (phi + delta) % (2 * cp.pi)
+            phi_r = (phi - delta) % (2 * cp.pi)
+            return (
+                cp.stack([R, theta, phi_l], axis=-1),
+                cp.stack([R, theta, phi_r], axis=-1)
+            )
+    
     def sphere_to_image_coords(self, sphere_coords, image_width, image_height):
-        """Original version of spherical to image coordinate conversion (more efficient)"""
+        """Modified for forward mapping: map sphere coords to target image coords"""
         with profiler.timer("Sphere_to_image_coords"):
-            sphere_coords = cp.asarray(sphere_coords)
-            r = sphere_coords[..., 0]
             theta = sphere_coords[..., 1]
-            phi = sphere_coords[..., 2]
+            phi_orig = sphere_coords[..., 2]
+            phi = (phi_orig + cp.pi) % (2 * cp.pi) - cp.pi
             theta = cp.clip(theta, 0, cp.pi)
-            phi = (phi + cp.pi) % (2 * cp.pi) - cp.pi
             lat = cp.pi / 2 - theta
             lon = phi
             u = lon / cp.pi
@@ -551,50 +567,155 @@ class Pano2stereo():
             y_float = (1 - v) * 0.5 * (image_height - 1)
             x = cp.round(x_float).astype(cp.int32)
             y = cp.round(y_float).astype(cp.int32)
-            image_coords = cp.stack([
-                cp.clip(x, 0, image_width - 1),
-                cp.clip(y, 0, image_height - 1)
-            ], axis=-1)
-            return image_coords
+            x = cp.clip(x, 0, image_width - 1)
+            y = cp.clip(y, 0, image_height - 1)
 
-    def sphere2pano_vectorized(self, sphere_coords, z_vals):
-        """Original version of efficient spherical parallax calculation"""
-        with profiler.timer("Sphere2pano_vectorized"):
-            # Ensure z_vals is 2D
-            z_vals = cp.asarray(z_vals)
-            assert z_vals.ndim == 2, "z_vals must be 2D, got shape {}".format(z_vals.shape)
-            
-            R = cp.asarray(sphere_coords[..., 0])
-            theta = cp.asarray(sphere_coords[..., 1])
-            phi = cp.asarray(sphere_coords[..., 2])
-            mask = z_vals < self.critical_depth
-            ratio = cp.clip(self.IPD / cp.where(mask, z_vals, cp.inf), -1.0, 1.0)
-            delta = cp.arcsin(ratio)
-            phi_l = (phi + delta) % (2 * cp.pi)
-            phi_r = (phi - delta) % (2 * cp.pi)
-            return (
-                cp.stack([R, theta, phi_l], axis=-1),
-                cp.stack([R, theta, phi_r], axis=-1)
-            )
+            # Seam fix
+            try:
+                eps = 1e-6
+                seam_mask = (x == 0) & (phi_orig > (cp.pi - eps))
+                if seam_mask.any():
+                    x = cp.where(seam_mask, image_width - 1, x)
+            except Exception:
+                pass
+
+            # For forward mapping, these are target coords
+            target_coords = cp.stack([x, y], axis=-1)
+            return target_coords
 
     def generate_stereo_pair(self, rgb_data, depth_data):
-        # print('-----------------[Generate_stereo_pairs]-----------\nSelf size: {}x{}, Depth size: {}x{}'.format(self.width, self.height, depth_data.shape[1], depth_data.shape[0]))
-        """Original version of efficient stereo pair generation"""
+        """Modified for forward mapping with depth-based z-buffering"""
         with profiler.timer("Generate_stereo_pair_total"):           
-            with profiler.timer("Sphere2pano_calculation"):
-                sphere_l, sphere_r = self.sphere2pano_vectorized(self.sphere_coords, depth_data)
-            with profiler.timer("Coordinate_mapping"):
+            with profiler.timer("Depth fix on sphere pixel"):
+                sphere_l, sphere_r = self.sphere2pano_vectorized(depth_data)
+            with profiler.timer("Revert sphere to image pixel"):
                 coords_l = self.sphere_to_image_coords(sphere_l, self.width, self.height)
                 coords_r = self.sphere_to_image_coords(sphere_r, self.width, self.height)
             with profiler.timer("Image_sampling"):
-                xl, yl = coords_l[..., 0], coords_l[..., 1]
-                xr, yr = coords_r[..., 0], coords_r[..., 1]
-                left = cp.zeros_like(rgb_data)
-                right = cp.zeros_like(rgb_data)
-                left[cp.arange(self.height)[:, None], cp.arange(self.width), :] = rgb_data[yl, xl, :]
-                right[cp.arange(self.height)[:, None], cp.arange(self.width), :] = rgb_data[yr, xr, :]
-            
-            return left, right
+                # Delegate to helper method that performs forward mapping with z-buffer on GPU
+                return self._forward_map_zbuffer(coords_l, coords_r, rgb_data, depth_data)
+
+    def _forward_map_zbuffer(self, coords_l, coords_r, rgb_data, depth_data):
+        """Forward-map source pixels to target using a single-pass GPU z-buffer kernel.
+
+        Inputs:
+        - coords_l/coords_r: CuPy arrays of shape (H,W,2) containing integer target coords
+        - rgb_data: CuPy array (H,W,3) uint8
+        - depth_data: CuPy array (H,W) float32
+
+        Returns: left, right (CuPy arrays H,W,3) and stores unmapped masks in self._last_masks
+        """
+        # Prepare integer target coordinates (flattened)
+        xl = coords_l[..., 0].ravel().astype(cp.int32)
+        yl = coords_l[..., 1].ravel().astype(cp.int32)
+        xr = coords_r[..., 0].ravel().astype(cp.int32)
+        yr = coords_r[..., 1].ravel().astype(cp.int32)
+
+        # Number of source pixels
+        N = int(self.height * self.width)
+
+        # Source flattened arrays
+        src_y, src_x = cp.meshgrid(cp.arange(self.height, dtype=cp.int32), cp.arange(self.width, dtype=cp.int32), indexing='ij')
+        src_y = src_y.ravel()
+        src_x = src_x.ravel()
+        src_depth = depth_data.ravel().astype(cp.float32)
+        src_rgb = rgb_data.reshape(-1, 3).astype(cp.uint8).ravel()
+
+        # Allocate target buffers (flattened)
+        depth_buf_l = cp.full((self.height * self.width,), 1e30, dtype=cp.float32)
+        rgb_buf_l = cp.zeros((self.height * self.width * 3,), dtype=cp.uint8)
+        count_buf_l = cp.zeros((self.height * self.width,), dtype=cp.int32)
+
+        depth_buf_r = cp.full((self.height * self.width,), 1e30, dtype=cp.float32)
+        rgb_buf_r = cp.zeros((self.height * self.width * 3,), dtype=cp.uint8)
+        count_buf_r = cp.zeros((self.height * self.width,), dtype=cp.int32)
+
+        # CUDA kernel: atomic z-buffer scatter (uses atomicCAS on uint representation of floats)
+        kernel_code = r'''
+        extern "C" __global__
+        void zbuffer_scatter(
+            const int N,
+            const int W,
+            const int H,
+            const int* tgt_x,
+            const int* tgt_y,
+            const float* depth_src,
+            const unsigned char* rgb_src,
+            float* depth_buf,
+            unsigned char* rgb_buf,
+            int* count_buf
+        ) {
+            int i = blockDim.x * blockIdx.x + threadIdx.x;
+            if (i >= N) return;
+
+            int x = tgt_x[i];
+            int y = tgt_y[i];
+            if (x < 0 || x >= W || y < 0 || y >= H) return;
+
+            int idx = y * W + x;
+
+            // increment count
+            if (count_buf) atomicAdd(&count_buf[idx], 1);
+
+            float d = depth_src[i];
+
+            unsigned int* depth_ui = (unsigned int*)depth_buf;
+            unsigned int old_ui = depth_ui[idx];
+            float oldf = __uint_as_float(old_ui);
+            unsigned int new_ui = __float_as_uint(d);
+
+            while (d < oldf) {
+                unsigned int prev = atomicCAS(depth_ui + idx, old_ui, new_ui);
+                if (prev == old_ui) {
+                    int rgb_idx = idx * 3;
+                    rgb_buf[rgb_idx + 0] = rgb_src[i * 3 + 0];
+                    rgb_buf[rgb_idx + 1] = rgb_src[i * 3 + 1];
+                    rgb_buf[rgb_idx + 2] = rgb_src[i * 3 + 2];
+                    break;
+                }
+                old_ui = prev;
+                oldf = __uint_as_float(old_ui);
+                if (!(d < oldf)) break;
+            }
+        }
+        '''
+
+        zbuffer_kernel = cp.RawKernel(kernel_code, 'zbuffer_scatter')
+
+        threads = 256
+        blocks = (N + threads - 1) // threads
+
+        # Launch kernel for left and right (two separate launches)
+        try:
+            zbuffer_kernel((blocks,), (threads,), (
+                N,
+                self.width,
+                self.height,
+                xl, yl, src_depth, src_rgb, depth_buf_l, rgb_buf_l, count_buf_l
+            ))
+        except Exception as e:
+            logging.error(f"zbuffer kernel (left) failed: {e}")
+
+        try:
+            zbuffer_kernel((blocks,), (threads,), (
+                N,
+                self.width,
+                self.height,
+                xr, yr, src_depth, src_rgb, depth_buf_r, rgb_buf_r, count_buf_r
+            ))
+        except Exception as e:
+            logging.error(f"zbuffer kernel (right) failed: {e}")
+
+        # Reshape outputs to H x W x 3
+        left = rgb_buf_l.reshape((self.height, self.width, 3))
+        right = rgb_buf_r.reshape((self.height, self.width, 3))
+
+        # Masks for unmapped pixels (count==0)
+        mask_left_unmapped = (count_buf_l.reshape((self.height, self.width)) == 0)
+        mask_right_unmapped = (count_buf_r.reshape((self.height, self.width)) == 0)
+        self._last_masks = (mask_left_unmapped, mask_right_unmapped)
+
+        return left, right
 
     @staticmethod
     def repair_black_regions(image):
@@ -734,10 +855,6 @@ class Pano2stereo():
         # Clean up precomputed coordinates
         if hasattr(self, 'sphere_coords'):
             del self.sphere_coords
-        if hasattr(self, 'grid_y'):
-            del self.grid_y
-        if hasattr(self, 'grid_x'):
-            del self.grid_x
         
         logging.info('[Pano2stereo] Resource cleanup completed')
 
