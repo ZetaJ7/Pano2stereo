@@ -244,6 +244,10 @@ class Pano2stereo:
                 '-r', str(self.stream_fps),
                 '-i', '-',
                 '-c:v', 'libx264',
+                # Force output to a widely-supported pixel format/profile to maximize
+                # compatibility with clients (ffplay, hardware decoders).
+                '-pix_fmt', 'yuv420p',
+                '-profile:v', 'baseline',
                 '-preset', 'ultrafast',
                 '-tune', 'zerolatency',
                 '-g', '30',
@@ -1191,7 +1195,7 @@ def main():
             critical_depth=CRITICAL_DEPTH, 
             url=URL,
             red_cyan=True,
-            max_frames=200
+            max_frames = None
         )
         
         # Create visualization directory and initialize frame counter
