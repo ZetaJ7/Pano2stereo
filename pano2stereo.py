@@ -9,7 +9,7 @@ import sys
 import logging
 import subprocess
 from pathlib import Path
-from tqdm import tqdm
+import queue
 from submodule.Flashdepth.inference import FlashDepthProcessor
 import cupy as cp
 from contextlib import contextmanager
@@ -240,6 +240,13 @@ class Pano2stereo:
         # Initialize RTSP streaming placeholders
         self.stream_process = None
         self.stream_fps = 30  # Default FPS for streaming
+        # Background streaming queue and writer thread
+        self._stream_queue = queue.Queue(maxsize=8)
+        self._stream_writer_thread = None
+        self._stream_thread_stop = threading.Event()
+        # How many frames between flushes in writer thread
+        self._stream_flush_interval = 4
+        self._stream_lock = threading.Lock()
 
         # Load model (FlashDepth)
         logging.info("Initializing FlashDepth model...")
@@ -352,6 +359,14 @@ class Pano2stereo:
                 raise RuntimeError("ffmpeg failed to start streaming; check ffmpeg stderr in logs")
 
             logging.info("RTSP streaming initialized successfully")
+            # Start background writer thread if not already running
+            try:
+                if self._stream_writer_thread is None or not self._stream_writer_thread.is_alive():
+                    self._stream_thread_stop.clear()
+                    self._stream_writer_thread = threading.Thread(target=self._stream_writer, name='stream-writer', daemon=True)
+                    self._stream_writer_thread.start()
+            except Exception as e:
+                logging.warning(f"Failed to start stream writer thread: {e}")
             
         except Exception as e:
             logging.error(f"Failed to initialize RTSP streaming: {e}")
@@ -359,75 +374,36 @@ class Pano2stereo:
 
     def stream_frame(self, frame):
         """Stream a frame to RTSP"""
-        if self.stream_process and self.stream_process.poll() is None:
+        # Prepare frame bytes and enqueue for background writer.
+        # Assumes caller guarantees correct size (user requested removal of resize logic).
+        try:
+            if isinstance(frame, cp.ndarray):
+                frame = cp.asnumpy(frame)
+            if frame.dtype != np.uint8:
+                frame = frame.astype(np.uint8)
+            frame = np.ascontiguousarray(frame)
+            data = frame.tobytes()
+
+            # Non-blocking enqueue: if queue full, drop the frame (real-time behavior)
             try:
-                # Ensure frame is in correct format (RGB, uint8)
-                if isinstance(frame, cp.ndarray):
-                    frame = cp.asnumpy(frame)
-                # Ensure correct dtype and contiguous layout
-                if frame.dtype != np.uint8:
-                    frame = frame.astype(np.uint8)
-                frame = np.ascontiguousarray(frame)
-
-                # Write frame to ffmpeg stdin
-                try:
-                    # Validate expected frame size using recorded stream resolution (self.stream_width/height)
-                    expected_shape = (self.height, self.width * (1 if self.stream_redcyan else 2), 3)
-                    if frame.shape != expected_shape:
-                        logging.warning(f"Frame shape mismatch: got {frame.shape}, expected {expected_shape}.")
-                        # Try to derive new dimensions from incoming frame
-                        new_h, new_w_total = frame.shape[0], frame.shape[1]
-                        # If width is even, assume side-by-side stereo (two halves)
-                        if new_w_total % 2 == 0:
-                            new_w = new_w_total // 2
-                        else:
-                            new_w = None
-
-                        # Compute target width/height for resize (use recorded stream dims)
-                        target_h = expected_shape[0]
-                        target_w = expected_shape[1]
-
-                        # If difference is small, just resize to expected shape and continue streaming
-                        if new_w is not None and abs(new_h - target_h) <= 8 and abs(new_w - (target_w // (1 if self.stream_redcyan else 2))) <= 8:
-                            logging.info(f"Resizing minor-mismatch frame {frame.shape} -> {expected_shape}")
-                            try:
-                                frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-                            except Exception as e:
-                                logging.error(f"Failed to resize frame: {e}. Skipping frame.")
-                                return
-                        else:
-                            # Significant change: resize frame to match current stream resolution
-                            if new_w is not None:
-                                logging.info(f"Resizing significant-mismatch frame {frame.shape} -> {expected_shape}")
-                                try:
-                                    frame = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-                                except Exception as e:
-                                    logging.error(f"Failed to resize frame: {e}. Skipping frame.")
-                                    return
-                            else:
-                                logging.error("Incoming frame width is odd; cannot split into two views reliably. Skipping frame.")
-                                return
-                    data = frame.tobytes()
-                    logging.debug(f"Writing frame to ffmpeg stdin: bytes={len(data)}, expected={frame.size}")
-                    self.stream_process.stdin.write(data)
-                    self.stream_process.stdin.flush()
-                except BrokenPipeError:
-                    logging.warning("ffmpeg stdin broken (BrokenPipeError). Restarting stream process")
-                    self._restart_streaming()
-                except Exception as e:
-                    logging.error(f"Failed to write frame to ffmpeg stdin: {e}")
-                    self._restart_streaming()
-                
-            except Exception as e:
-                logging.error(f"Failed to stream frame: {e}")
-                # Try to restart streaming
-                self._restart_streaming()
-        else:
-            logging.warning("Stream process not available, attempting to restart...")
-            self._restart_streaming()
+                self._stream_queue.put_nowait(data)
+            except queue.Full:
+                # Drop frame; count or log at debug level to avoid noisy logs
+                logging.debug("Stream queue full, dropping frame")
+        except Exception as e:
+            logging.error(f"Failed to prepare frame for streaming: {e}")
 
     def _restart_streaming(self):
         """Restart RTSP streaming"""
+        # When restarting, clear any queued frames to avoid stale data
+        try:
+            while not self._stream_queue.empty():
+                try:
+                    self._stream_queue.get_nowait()
+                except Exception:
+                    break
+        except Exception:
+            pass
         if self.stream_process:
             try:
                 self.stream_process.terminate()
@@ -451,8 +427,66 @@ class Pano2stereo:
 
         self._init_streaming()
 
+    def _stream_writer(self):
+        """Background writer thread that consumes frames from queue and writes to ffmpeg stdin.
+
+        This avoids blocking the main loop on IO. It flushes every _stream_flush_interval frames.
+        """
+        frames_since_flush = 0
+        while not self._stream_thread_stop.is_set():
+            try:
+                data = self._stream_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            try:
+                # Use a lock around process access to avoid races with restart/stop
+                with self._stream_lock:
+                    if not self.stream_process or self.stream_process.poll() is not None:
+                        # Stream is dead; try restart and drop this frame
+                        logging.debug("Stream writer detected dead process; restarting")
+                        try:
+                            self._restart_streaming()
+                        except Exception:
+                            pass
+                        continue
+                    try:
+                        self.stream_process.stdin.write(data)
+                    except BrokenPipeError:
+                        logging.warning("ffmpeg stdin broken in writer thread; restarting")
+                        try:
+                            self._restart_streaming()
+                        except Exception:
+                            pass
+                        continue
+                frames_since_flush += 1
+                if frames_since_flush >= getattr(self, '_stream_flush_interval', 4):
+                    try:
+                        with self._stream_lock:
+                            if self.stream_process and self.stream_process.stdin:
+                                self.stream_process.stdin.flush()
+                    except Exception:
+                        pass
+                    frames_since_flush = 0
+            except Exception as e:
+                logging.debug(f"Stream writer thread error: {e}")
+                # Avoid tight-looping on error
+                time.sleep(0.05)
+
     def stop_streaming(self):
         """Stop RTSP streaming"""
+        # Signal writer thread to stop first
+        try:
+            self._stream_thread_stop.set()
+        except Exception:
+            pass
+        # Join writer thread
+        try:
+            if self._stream_writer_thread is not None and self._stream_writer_thread.is_alive():
+                self._stream_writer_thread.join(timeout=2.0)
+        except Exception:
+            pass
+
         if self.stream_process:
             try:
                 self.stream_process.stdin.close()
