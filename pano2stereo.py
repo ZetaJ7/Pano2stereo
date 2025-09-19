@@ -5,6 +5,7 @@ import time
 import math
 import os
 import cv2
+import sys
 import logging
 import subprocess
 from pathlib import Path
@@ -53,7 +54,7 @@ def torch_to_cupy(tensor1, tensor2):
                 if not x.is_contiguous():
                     x = x.contiguous()
                 try:
-                    return cp.fromDlpack(_dlpack.to_dlpack(x))
+                    return cp.from_dlpack(_dlpack.to_dlpack(x))
                 except Exception:
                     # Fallback if DLPack path fails for any reason
                     return cp.asarray(x.detach().cpu().numpy())
@@ -136,6 +137,8 @@ class PerformanceProfiler:
     def __init__(self):
         self.timings = {}
         self.active_timers = {}
+        # Number of lines last rendered to terminal by render_live
+        self._last_live_lines = 0
     
     def reset(self):
         """Reset timer data"""
@@ -155,11 +158,64 @@ class PerformanceProfiler:
             yield
         finally:
             elapsed = time.time() - start
-            self.timings.setdefault(name, []).append(elapsed)
+            lst = self.timings.setdefault(name, [])
+            lst.append(elapsed)
+            # Compute simple statistics
+            count = len(lst)
+            avg = sum(lst) / count if count > 0 else elapsed
             try:
-                logging.debug(f"[profiler] {name}: {elapsed:.6f}s")
+                # Use INFO to ensure visibility in logs; include count and average
+                logging.info(f"[Timer] {name}: {elapsed:.6f}s (count={count}, avg={avg:.6f}s)")
             except Exception:
+                # Best-effort: ignore logging errors
                 pass
+
+    def render_live(self, max_lines: int = 10):
+        """Render a compact profiler summary to the terminal, updating in-place.
+
+        This uses ANSI cursor movement to overwrite the previous block so the
+        profiler output appears to update instead of appending new lines.
+        """
+        try:
+            # Prepare sorted stats: by average descending
+            items = []
+            for name, lst in self.timings.items():
+                if not lst:
+                    continue
+                last = lst[-1]
+                count = len(lst)
+                avg = sum(lst) / count
+                items.append((name, last, count, avg))
+
+            if not items:
+                return
+
+            items.sort(key=lambda x: x[3], reverse=True)  # sort by avg desc
+            lines = []
+            for name, last, count, avg in items[:max_lines]:
+                lines.append(f"[Timer] {name}: {last:.6f}s (count={count}, avg={avg:.6f}s)")
+
+            out = sys.stdout
+
+            # Move cursor up to the start of previous block if any
+            if self._last_live_lines > 0:
+                out.write(f"\x1b[{self._last_live_lines}A")
+
+            # Write new block, clearing each line before writing
+            for line in lines:
+                out.write("\x1b[2K")  # clear entire line
+                out.write(line + "\n")
+
+            # If we previously printed more lines than now, clear the leftover lines
+            if self._last_live_lines > len(lines):
+                for _ in range(self._last_live_lines - len(lines)):
+                    out.write("\x1b[2K\n")
+
+            out.flush()
+            self._last_live_lines = len(lines)
+        except Exception:
+            # Silent fallback if terminal control fails
+            pass
 
 # Global profiler instance used throughout the module
 profiler = PerformanceProfiler()
@@ -451,64 +507,62 @@ class Pano2stereo:
 
     def sphere2pano_vectorized(self, depth_map):
         """Original version of efficient spherical parallax calculation"""
-        with profiler.timer("Sphere2pano_vectorized"):
-            # Ensure depth_map is 2D
-            depth_map = cp.asarray(depth_map)
-            assert depth_map.ndim == 2, "depth_map must be 2D, got shape {}".format(depth_map.shape)
-            
-            R = cp.asarray(self.sphere_coords[..., 0])
-            theta = cp.asarray(self.sphere_coords[..., 1])
-            phi = cp.asarray(self.sphere_coords[..., 2])
-            mask = depth_map < self.critical_depth
-            ratio = cp.clip(self.IPD / cp.where(mask, depth_map, cp.inf), -1.0, 1.0)
-            delta = cp.arcsin(ratio)
-            phi_l = (phi + delta) % (2 * cp.pi)
-            phi_r = (phi - delta) % (2 * cp.pi)
-            return (
-                cp.stack([R, theta, phi_l], axis=-1),
-                cp.stack([R, theta, phi_r], axis=-1)
-            )
+        # Ensure depth_map is 2D
+        depth_map = cp.asarray(depth_map)
+        assert depth_map.ndim == 2, "depth_map must be 2D, got shape {}".format(depth_map.shape)
+        
+        R = cp.asarray(self.sphere_coords[..., 0])
+        theta = cp.asarray(self.sphere_coords[..., 1])
+        phi = cp.asarray(self.sphere_coords[..., 2])
+        mask = depth_map < self.critical_depth
+        ratio = cp.clip(self.IPD / cp.where(mask, depth_map, cp.inf), -1.0, 1.0)
+        delta = cp.arcsin(ratio)
+        phi_l = (phi + delta) % (2 * cp.pi)
+        phi_r = (phi - delta) % (2 * cp.pi)
+        return (
+            cp.stack([R, theta, phi_l], axis=-1),
+            cp.stack([R, theta, phi_r], axis=-1)
+        )
     
     def sphere_to_image_coords(self, sphere_coords, image_width, image_height):
         """Modified for forward mapping: map sphere coords to target image coords"""
-        with profiler.timer("Sphere_to_image_coords"):
-            theta = sphere_coords[..., 1]
-            phi_orig = sphere_coords[..., 2]
-            phi = (phi_orig + cp.pi) % (2 * cp.pi) - cp.pi
-            theta = cp.clip(theta, 0, cp.pi)
-            lat = cp.pi / 2 - theta
-            lon = phi
-            u = lon / cp.pi
-            v = lat / (cp.pi / 2)
-            x_float = (u + 1) * 0.5 * (image_width - 1)
-            y_float = (1 - v) * 0.5 * (image_height - 1)
-            x = cp.round(x_float).astype(cp.int32)
-            y = cp.round(y_float).astype(cp.int32)
-            x = cp.clip(x, 0, image_width - 1)
-            y = cp.clip(y, 0, image_height - 1)
+        theta = sphere_coords[..., 1]
+        phi_orig = sphere_coords[..., 2]
+        phi = (phi_orig + cp.pi) % (2 * cp.pi) - cp.pi
+        theta = cp.clip(theta, 0, cp.pi)
+        lat = cp.pi / 2 - theta
+        lon = phi
+        u = lon / cp.pi
+        v = lat / (cp.pi / 2)
+        x_float = (u + 1) * 0.5 * (image_width - 1)
+        y_float = (1 - v) * 0.5 * (image_height - 1)
+        x = cp.round(x_float).astype(cp.int32)
+        y = cp.round(y_float).astype(cp.int32)
+        x = cp.clip(x, 0, image_width - 1)
+        y = cp.clip(y, 0, image_height - 1)
 
-            # Seam fix
-            try:
-                eps = 1e-6
-                seam_mask = (x == 0) & (phi_orig > (cp.pi - eps))
-                if seam_mask.any():
-                    x = cp.where(seam_mask, image_width - 1, x)
-            except Exception:
-                pass
+        # Seam fix
+        try:
+            eps = 1e-6
+            seam_mask = (x == 0) & (phi_orig > (cp.pi - eps))
+            if seam_mask.any():
+                x = cp.where(seam_mask, image_width - 1, x)
+        except Exception:
+            pass
 
-            # For forward mapping, these are target coords
-            target_coords = cp.stack([x, y], axis=-1)
-            return target_coords
+        # For forward mapping, these are target coords
+        target_coords = cp.stack([x, y], axis=-1)
+        return target_coords
 
     def generate_stereo_pair(self, rgb_data, depth_data):
         """Modified for forward mapping with depth-based z-buffering"""
-        with profiler.timer("Generate_stereo_pair_total"):           
-            with profiler.timer("Depth fix on sphere pixel"):
+        with profiler.timer("[generate_stereo_pair] Function total"):           
+            with profiler.timer("---------------------\n[generate_stereo_pair] Depth fix on circular projection"):
                 sphere_l, sphere_r = self.sphere2pano_vectorized(depth_data)
-            with profiler.timer("Revert sphere to image pixel"):
+            with profiler.timer("[generate_stereo_pair] Revert sphere to image pixel"):
                 coords_l = self.sphere_to_image_coords(sphere_l, self.width, self.height)
                 coords_r = self.sphere_to_image_coords(sphere_r, self.width, self.height)
-            with profiler.timer("Image_sampling"):
+            with profiler.timer("[generate_stereo_pair] Image painting (Z-Buffer)"):
                 # Delegate to helper method that performs forward mapping with z-buffer on GPU
                 return self._forward_map_zbuffer(coords_l, coords_r, rgb_data, depth_data)
 
@@ -964,21 +1018,21 @@ def save_results_visualization(left, right, left_repaired, right_repaired, depth
         right_rep_np = _to_numpy(right_repaired)
 
         # Save images
-        cv2.imwrite(str(output_path / f"left_{frame_idx:03d}.png" if frame_idx is not None else output_path / "left.png"), cv2.cvtColor(left_np, cv2.COLOR_RGB2BGR))
-        cv2.imwrite(str(output_path / f"right_{frame_idx:03d}.png" if frame_idx is not None else output_path / "right.png"), cv2.cvtColor(right_np, cv2.COLOR_RGB2BGR))
-        cv2.imwrite(str(output_path / f"left_repaired_{frame_idx:03d}.png" if frame_idx is not None else output_path / "left_repaired.png"), cv2.cvtColor(left_rep_np, cv2.COLOR_RGB2BGR))
-        cv2.imwrite(str(output_path / f"right_repaired_{frame_idx:03d}.png" if frame_idx is not None else output_path / "right_repaired.png"), cv2.cvtColor(right_rep_np, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(str(output_path / f"left_{frame_idx:05d}.png" if frame_idx is not None else output_path / "left.png"), cv2.cvtColor(left_np, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(str(output_path / f"right_{frame_idx:05d}.png" if frame_idx is not None else output_path / "right.png"), cv2.cvtColor(right_np, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(str(output_path / f"left_repaired_{frame_idx:05d}.png" if frame_idx is not None else output_path / "left_repaired.png"), cv2.cvtColor(left_rep_np, cv2.COLOR_RGB2BGR))
+        cv2.imwrite(str(output_path / f"right_repaired_{frame_idx:05d}.png" if frame_idx is not None else output_path / "right_repaired.png"), cv2.cvtColor(right_rep_np, cv2.COLOR_RGB2BGR))
 
         # Save stitched pano_repair if available
         if pano_repair is not None:
             pano_np = _to_numpy(pano_repair)
-            cv2.imwrite(str(output_path / f"stereo_{frame_idx:03d}.png" if frame_idx is not None else output_path / "stereo.png"), cv2.cvtColor(pano_np, cv2.COLOR_RGB2BGR))
+            cv2.imwrite(str(output_path / f"stereo_{frame_idx:05d}.png" if frame_idx is not None else output_path / "stereo.png"), cv2.cvtColor(pano_np, cv2.COLOR_RGB2BGR))
 
         # Optional red-cyan generation (GPU-first using gpu_create_anaglyph)
         if PARAMS.get("ENABLE_RED_CYAN", False) and generator is not None:
             try:
                 anaglyph_np = gpu_create_anaglyph(left_rep_np, right_rep_np)
-                anaglyph_path = output_path / (f"red_cyan_{frame_idx:03d}.png" if frame_idx is not None else "red_cyan.png")
+                anaglyph_path = output_path / (f"red_cyan_{frame_idx:05d}.png" if frame_idx is not None else "red_cyan.png")
                 if anaglyph_np is not None:
                     try:
                         cv2.imwrite(str(anaglyph_path), cv2.cvtColor(anaglyph_np, cv2.COLOR_RGB2BGR))
@@ -991,7 +1045,7 @@ def save_results_visualization(left, right, left_repaired, right_repaired, depth
                         left_img = Image.fromarray(left_rep_np.astype(np.uint8))
                         right_img = Image.fromarray(right_rep_np.astype(np.uint8))
                         anaglyph = stereoscopy.create_anaglyph([left_img, right_img], method="color", color_scheme="red-cyan", luma_coding="rgb")
-                        anaglyph.save(str(output_path / f"red_cyan_{frame_idx:03d}.png" if frame_idx is not None else output_path / "red_cyan.png"))
+                        anaglyph.save(str(output_path / f"red_cyan_{frame_idx:05d}.png" if frame_idx is not None else output_path / "red_cyan.png"))
                     except Exception as e:
                         logging.warning(f"Fallback stereoscopy anaglyph generation failed: {e}")
             except Exception as e:
@@ -1093,7 +1147,7 @@ def save_depth_visualization(depth, stereo_dir, frame_count, generator, critical
         except Exception:
             combined = gray_rgb
 
-        depth_gray_path = Path(stereo_dir) / f"depth_gray_{frame_count:03d}.png"
+        depth_gray_path = Path(stereo_dir) / f"depth_gray_{frame_count:05d}.png"
 
         # Sanity: log mapping between depth values and bar endpoints to detect inversion
         try:
@@ -1194,8 +1248,9 @@ def main():
             pixel=PIXEL, 
             critical_depth=CRITICAL_DEPTH, 
             url=URL,
-            red_cyan=True,
-            max_frames = None
+            # red_cyan = False,
+            red_cyan = True,
+            max_frames = 600
         )
         
         # Create visualization directory and initialize frame counter
@@ -1223,51 +1278,68 @@ def main():
             depth = generator.disparity_to_depth(disparity_map=depth, critical_depth=CRITICAL_DEPTH)  # Convert to meters and clamp
             
             rgb = bgr[..., ::-1]  # Convert BGR to RGB
-            logging.info(f"[MAIN LOOP] Depth shape: {depth.shape}, RGB shape: {rgb.shape}")
+            # logging.info(f"[MAIN LOOP] Depth shape: {depth.shape}, RGB shape: {rgb.shape}")
             # At this point we trust FlashDepth: rgb and depth are same resolution
-            left, right = generator.generate_stereo_pair(rgb_data=rgb, depth_data=depth)
-        
-            # 2.2 🔧 Image repair (single combined call - GPU-friendly)
-            # Combine left and right repair into a single call to avoid duplicate GPU work
-            try:
-                left_repaired, right_repaired, pano_repair = generator.repair_black_regions_pair(left, right)
-            except Exception as e:
-                logging.warning(f"[MAIN LOOP] Combined repair failed, falling back to parallel repair: {e}")
-                # Fall back to previous behavior (parallel threads) if combined fails
-                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                    future_left = executor.submit(generator.repair_black_regions, left)
-                    future_right = executor.submit(generator.repair_black_regions, right)
-                    left_repaired = future_left.result()
-                    right_repaired = future_right.result()
-                    pano_repair = np.concatenate([left_repaired, right_repaired], axis=1)
-
-            # Save and post-process (not participating in core timing)
-            output_dir = Path(generator.outputdir) / (f"visualization/")
-            if (0) and (frame_count % 20 == 0):
-                save_results_visualization(left, right, left_repaired, right_repaired, depth, output_dir, pano_repair=pano_repair, frame_idx=frame_count, generator=generator)
-
-            # Optional: fast GPU-generated red-cyan anaglyph
-            anaglyph_np = gpu_create_anaglyph(left_repaired, right_repaired)
-            if (True) and (frame_count % 20 == 0):
-                anaglyph_path = Path(output_dir) / (f"red_cyan_{frame_count:03d}.png")
-                cv2.imwrite(str(anaglyph_path), cv2.cvtColor(anaglyph_np, cv2.COLOR_RGB2BGR))
-                logging.info(f"[MAIN LOOP] Saved GPU red-cyan anaglyph: {anaglyph_path.name}")
-            else:
-                logging.debug("[MAIN LOOP] GPU anaglyph generation returned None; skipping save")
+            with profiler.timer("[MAIN LOOP] RGB+Depth to Streaming"):
+                with profiler.timer("[Pano2stereo] RGB+Depth to Stereo"):
+                    left, right = generator.generate_stereo_pair(rgb_data=rgb, depth_data=depth)
             
-            # 2.3  Streaming
-            if generator.stream_redcyan:         
-                # Stream red_cyan to target URL
-                logging.info(f"[MAIN LOOP] Streaming frame size: {anaglyph_np.shape[1]}x{anaglyph_np.shape[0]}")
-                generator.stream_frame(anaglyph_np)  
-            else:
-                # Stream Pano(left+right)to target URL
-                logging.info(f"[MAIN LOOP]Streaming frame size: {pano_repair.shape[1]}x{pano_repair.shape[0]}")
-                generator.stream_frame(pano_repair)  
+                # 2.2 🔧 Image repair (single combined call - GPU-friendly)
+                # Combine left and right repair into a single call to avoid duplicate GPU work
+                try:
+                    with profiler.timer("[Pano2stereo] Repair_black_regions_pair"):
+                        left_repaired, right_repaired, pano_repair = generator.repair_black_regions_pair(left, right)
+                except Exception as e:
+                    logging.warning(f"[MAIN LOOP] Combined repair failed, falling back to parallel repair: {e}")
+                    # Fall back to previous behavior (parallel threads) if combined fails
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                        future_left = executor.submit(generator.repair_black_regions, left)
+                        future_right = executor.submit(generator.repair_black_regions, right)
+                        left_repaired = future_left.result()
+                        right_repaired = future_right.result()
+                        pano_repair = np.concatenate([left_repaired, right_repaired], axis=1)
+
+                # Save and post-process (not participating in core timing)
+                output_dir = Path(generator.outputdir) / (f"visualization/")
+                # if (1) and (frame_count % 20 == 0):
+                #     save_results_visualization(left, right, left_repaired, right_repaired, depth, output_dir, pano_repair=pano_repair, frame_idx=frame_count, generator=generator)
+
+                # Optional: fast GPU-generated red-cyan anaglyph           
+                # 2.3  Streaming
+                if generator.stream_redcyan:  
+                    with profiler.timer("[MAIN LOOP] Generating Red-Cyan Anaglyph"):
+                        anaglyph_np = gpu_create_anaglyph(left_repaired, right_repaired)
+                    # if (False) and (frame_count % 20 == 0):
+                    #     anaglyph_path = Path(output_dir) / (f"red_cyan_{frame_count:05d}.png")
+                    #     cv2.imwrite(str(anaglyph_path), cv2.cvtColor(anaglyph_np, cv2.COLOR_RGB2BGR))
+                    #     logging.info(f"[MAIN LOOP] Saved GPU red-cyan anaglyph: {anaglyph_path.name}")
+                    # else:
+                    #     logging.debug("[MAIN LOOP] GPU anaglyph generation returned None; skipping save")       
+                        # Stream red_cyan to target URL
+                    # logging.info(f"[MAIN LOOP] Streaming frame size: {anaglyph_np.shape[1]}x{anaglyph_np.shape[0]}")
+                    with profiler.timer("[MAIN LOOP] Streaming Red-Cyan Anaglyph"):
+                        generator.stream_frame(anaglyph_np)  
+                else:
+                    # Stream Pano(left+right)to target URL
+                    # logging.info(f"[MAIN LOOP]Streaming frame size: {pano_repair.shape[1]}x{pano_repair.shape[0]}")
+                    with profiler.timer("[MAIN LOOP] Streaming Left-Right Pano"):
+                        generator.stream_frame(pano_repair)  
             
-            # 2.4 Frame_count add
+            # 2.4 Frame_count and save
+            # save to PNGs
+            if True:
+                (output_dir / "stream_frames").mkdir(parents=True, exist_ok=True)
+                if generator.stream_redcyan:
+                    cv2.imwrite(str(output_dir / f"stream_frames/red_cyan_{frame_count:05d}.png"), cv2.cvtColor(anaglyph_np.astype(np.uint8), cv2.COLOR_RGB2BGR))
+                else:
+                    cv2.imwrite(str(output_dir / f"stream_frames/pano_{frame_count:05d}.png"), cv2.cvtColor(cp.asnumpy(pano_repair).astype(np.uint8), cv2.COLOR_RGB2BGR))
             frame_count += 1
-            # generator.stream_frame(red_cyan)  # Stream the red-cyan image 
+            # Update live profiler output in terminal (overwrites previous block)
+            try:
+                profiler.render_live(max_lines=12)
+            except Exception:
+                pass
+
 
         # Memory cleanup
         del rgb, depth, left, right
