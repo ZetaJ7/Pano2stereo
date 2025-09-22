@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import numpy as np
 import threading
 import time
@@ -220,6 +221,125 @@ class PerformanceProfiler:
 # Global profiler instance used throughout the module
 profiler = PerformanceProfiler()
     
+class FrameReader:
+    """Independent frame reader for maximum speed stereo generation"""
+    def __init__(self, url, target_height=None, target_width=None, flashdepth_processor=None):
+        self.url = url
+        self.target_height = target_height
+        self.target_width = target_width
+        self.current_frame = None
+        self.frame_lock = threading.Lock()
+        self.running = True
+        
+        # FlashDepthProcessor direct communication
+        self.flashdepth_processor = flashdepth_processor
+        self.enable_flashdepth_send = (flashdepth_processor is not None and 
+                                      getattr(flashdepth_processor, 'external_frame_mode', False))
+        
+        # Initialize OpenCV VideoCapture
+        self.cap = cv2.VideoCapture(url)
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Failed to open video stream: {url}")
+            
+        # Read initial frame to get dimensions
+        ret, frame = self.cap.read()
+        if not ret:
+            raise RuntimeError("Failed to read initial frame from video stream")
+        
+        # Calculate FlashDepth compatible resolution (14-multiple) from initial frame
+        original_height, original_width = frame.shape[:2]
+        self.flashdepth_height = ((original_height + 13) // 14) * 14
+        self.flashdepth_width = ((original_width + 13) // 14) * 14
+        self.needs_flashdepth_resize = (original_height != self.flashdepth_height or 
+                                       original_width != self.flashdepth_width)
+        logging.info(f"[FrameReader] FlashDepth resolution: {self.flashdepth_width}x{self.flashdepth_height}, needs resize: {self.needs_flashdepth_resize}")
+        
+        # Store initial frame (now with resize info available)
+        with self.frame_lock:
+            self.current_frame = self._process_frame(frame)
+        
+        # Start reading thread
+        self.read_thread = threading.Thread(target=self._read_loop, daemon=True)
+        self.read_thread.start()
+        logging.info(f"[FrameReader] Started independent frame reader for {url} with FlashDepth direct send: {self.enable_flashdepth_send}")
+    
+    def _process_frame(self, frame):
+        """Process frame: BGR->RGB and resize to FlashDepth compatible resolution"""
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Always resize to FlashDepth compatible resolution (14-multiple) for consistency
+        if self.needs_flashdepth_resize:
+            rgb_frame = cv2.resize(rgb_frame, (self.flashdepth_width, self.flashdepth_height))
+        
+        return rgb_frame
+    
+    def _send_to_flashdepth(self, frame):
+        """Send frame directly to FlashDepthProcessor queue (optimized timing)"""
+        if not self.enable_flashdepth_send:
+            return
+            
+        try:
+            # Frame is already resized to FlashDepth compatible resolution in _process_frame
+            flashdepth_frame = frame
+            
+            # Convert to torch tensor format expected by FlashDepthProcessor
+            frame_tensor = torch.from_numpy(flashdepth_frame).float()
+            # Convert [H, W, C] -> [C, H, W]
+            if frame_tensor.dim() == 3 and frame_tensor.shape[2] == 3:
+                frame_tensor = frame_tensor.permute(2, 0, 1)
+            
+            # Send directly to FlashDepthProcessor queue (bypass process_external_frame)
+            if (self.flashdepth_processor.frame_queue is not None and 
+                hasattr(self.flashdepth_processor, 'frame_queue')):
+                try:
+                    # Non-blocking send with queue replacement if full
+                    self.flashdepth_processor.frame_queue.put_nowait(frame_tensor)
+                except queue.Full:
+                    # Drop oldest frame and insert new one for real-time behavior
+                    try:
+                        self.flashdepth_processor.frame_queue.get_nowait()
+                        self.flashdepth_processor.frame_queue.put_nowait(frame_tensor)
+                    except queue.Empty:
+                        pass
+        except Exception as e:
+            logging.warning(f"[FrameReader] Failed to send frame to FlashDepth: {e}")
+    
+    def _read_loop(self):
+        """Continuous frame reading loop with direct FlashDepth sending"""
+        while self.running:
+            ret, frame = self.cap.read()
+            if not ret:
+                logging.warning("[FrameReader] Failed to read frame, attempting to reconnect...")
+                self.cap.release()
+                time.sleep(0.1)
+                self.cap = cv2.VideoCapture(self.url)
+                continue
+            
+            processed_frame = self._process_frame(frame)
+            
+            # Send to FlashDepth immediately for best timing
+            self._send_to_flashdepth(processed_frame)
+            
+            # Update local frame for main loop access
+            with self.frame_lock:
+                self.current_frame = processed_frame
+            
+            # 移除帧率控制，让系统以最大速度读取帧
+            # time.sleep(1.0 / 30.0)  # 原有的30fps限制
+    
+    def get_latest_frame(self):
+        """Get the latest available frame (thread-safe)"""
+        with self.frame_lock:
+            return self.current_frame.copy() if self.current_frame is not None else None
+    
+    def stop(self):
+        """Stop the frame reader"""
+        self.running = False
+        if self.read_thread.is_alive():
+            self.read_thread.join(timeout=1.0)
+        self.cap.release()
+
+
 class Pano2stereo:
     def __init__(self, IPD, pro_radius, pixel, critical_depth, url, red_cyan=True, max_frames=None):
         # Store configuration
@@ -248,24 +368,57 @@ class Pano2stereo:
         self._stream_flush_interval = 4
         self._stream_lock = threading.Lock()
 
-        # Load model (FlashDepth)
-        logging.info("Initializing FlashDepth model...")
-        self.flashdepth_processor = FlashDepthProcessor(config_path="configs/flashdepth.yaml", url=self.url, stream_mode=True, save_depth_png=False, save_frame=False, max_frames=max_frames, run_dir=self.outputdir)
+        # 首先创建 FlashDepthProcessor (外部帧模式)
+        logging.info("Initializing FlashDepth model in external frame mode...")
+        self.flashdepth_processor = FlashDepthProcessor(
+            config_path="configs/flashdepth.yaml", 
+            url=None,  # 不需要URL，使用外部帧
+            stream_mode=True, 
+            save_depth_png=False, 
+            save_frame=False, 
+            max_frames=max_frames, 
+            run_dir=self.outputdir,
+            external_frame_mode=True  # 启用外部帧模式
+        )
+
+        # 使用单一帧读取器，直接连接到FlashDepthProcessor
+        logging.info("[Pano2stereo] Initializing frame reader with direct FlashDepth connection...")
+        self.frame_reader = FrameReader(url=self.url, flashdepth_processor=self.flashdepth_processor)
+        
+        # 等待帧读取器产生第一帧以获取分辨率
+        logging.info("[Pano2stereo] Waiting for first frame to determine resolution...")
+        while self.frame_reader.get_latest_frame() is None:
+            time.sleep(0.01)
+        
+        first_frame = self.frame_reader.get_latest_frame()
+        original_height, original_width = first_frame.shape[:2]
+        
+        # 从 FrameReader 获取 FlashDepth 兼容的分辨率 (FrameReader已处理resize)
+        self.height = self.frame_reader.flashdepth_height
+        self.width = self.frame_reader.flashdepth_width
+        
+        logging.info(f"[Pano2stereo] Original resolution: {original_width}x{original_height}")
+        logging.info(f"[Pano2stereo] FlashDepth resolution: {self.width}x{self.height} (FrameReader handles resize)")
+        logging.info(f"[Pano2stereo] Frame resize now handled in FrameReader - no main loop resize needed")
 
         # Start FlashDepth inference in a separate thread
         self.inference_thread = threading.Thread(target=self.flashdepth_processor.run_inference, daemon=True)
         self.inference_thread.start()
-        logging.info('[FlashDepth] Inference thread started in Pano2stereo.__init__')
+        logging.info('[FlashDepth] Inference thread started in external frame mode')
 
-        # Wait for FlashDepth to produce an initial prediction and read resolution
-        logging.info("[Pano2stereo] Waiting for FlashDepth inference to start...")
-        while self.flashdepth_processor.pred is None:
-            time.sleep(0.02)
-
-        # Read inferred resolution
-        self.height = self.flashdepth_processor.pred[0].shape[0]
-        self.width = self.flashdepth_processor.pred[0].shape[1]
-        logging.info(f"[Pano2stereo] Got Input resolution from FlashDepth: {self.width}x{self.height}")
+        # 等待FlashDepth模型准备好
+        if self.flashdepth_processor.model_ready:
+            self.flashdepth_processor.model_ready.wait()
+            logging.info("[Pano2stereo] FlashDepth model is ready")
+        
+        # Thread-safe storage for latest depth map
+        self.latest_depth = None
+        self.depth_lock = threading.Lock()
+        
+        # 初始化深度更新线程，用于定期从FlashDepth获取最新深度
+        self.depth_update_thread = threading.Thread(target=self._depth_update_worker, daemon=True)
+        self.depth_update_thread.start()
+        logging.info("[Pano2stereo] Depth update worker thread started")
 
         # Initialize streaming pipeline now that dimensions are known
         self._init_streaming()
@@ -276,7 +429,75 @@ class Pano2stereo:
 
         logging.info('[Pano2stereo] Initialization completed')
 
+    def update_depth_from_flashdepth(self):
+        """Update latest depth map from FlashDepth processor (thread-safe)"""
+        if self.flashdepth_processor.pred is not None:
+            pred = self.flashdepth_processor.pred  # depth tensor or CuPy array
+            depth_cupy = None
+            try:
+                if isinstance(pred, cp.ndarray):
+                    depth_cupy = pred
+                elif isinstance(pred, torch.Tensor):
+                    # Assume CUDA tensor; ensure float32 and contiguous, then zero-copy via DLPack
+                    t = pred.detach().contiguous()
+                    if t.dtype != torch.float32:
+                        t = t.to(torch.float32)
+                    from torch.utils import dlpack as _dlpack
+                    if hasattr(cp, 'fromDlpack'):
+                        depth_cupy = cp.fromDlpack(_dlpack.to_dlpack(t))
+                    else:
+                        depth_cupy = cp.from_dlpack(_dlpack.to_dlpack(t))
+            except Exception as e:
+                # Keep silent/minimal logging per request; skip on failure
+                pass
 
+            if depth_cupy is not None:
+                with self.depth_lock:
+                    self.latest_depth = depth_cupy
+        else:
+            logging.debug("[update_depth_from_flashdepth] No depth available from FlashDepth yet")
+            time.sleep(0.01)  # Avoid busy-waiting
+    
+    def get_latest_depth(self):
+        """Get the latest available depth map (thread-safe)"""
+        with self.depth_lock:
+            return self.latest_depth
+    
+    def send_frame_to_flashdepth(self, frame):
+        """将帧发送给FlashDepthProcessor进行深度预测 (已优化：FrameReader直接发送)"""
+        # 如果FrameReader已启用直接发送，跳过此方法避免重复发送
+        if (hasattr(self, 'frame_reader') and 
+            getattr(self.frame_reader, 'enable_flashdepth_send', False)):
+            # logging.debug("[send_frame_to_flashdepth] Skipping: FrameReader handles direct sending")
+            return
+        
+        # 保留原有逻辑以保持向后兼容性
+        if self.flashdepth_processor and self.flashdepth_processor.external_frame_mode:
+            # 确保帧格式正确
+            if frame is not None:
+                # 转换为torch tensor并调整维度
+                if not isinstance(frame, torch.Tensor):
+                    frame_tensor = torch.from_numpy(frame).float()
+                else:
+                    frame_tensor = frame.float()
+                
+                # 确保维度为 [H, W, C] -> [C, H, W]
+                if frame_tensor.dim() == 3 and frame_tensor.shape[2] == 3:
+                    frame_tensor = frame_tensor.permute(2, 0, 1)
+                
+                # 发送到FlashDepthProcessor
+                self.flashdepth_processor.process_external_frame(frame_tensor)
+    
+    def _depth_update_worker(self):
+        """Background worker thread to update depth at maximum speed"""
+        while self.running:
+            try:
+                self.update_depth_from_flashdepth()
+                # 减少sleep时间，让深度更新更频繁
+                time.sleep(0.01)  # 100fps更新频率
+            except Exception as e:
+                logging.warning(f"[DepthUpdateWorker] Error updating depth: {e}")
+                time.sleep(0.1)  # Brief sleep on error
 
     def _init_streaming(self):
         """Initialize RTSP streaming pipeline"""
@@ -895,11 +1116,9 @@ class Pano2stereo:
             # return as CuPy arrays to keep consistency with pipeline (main expects cp arrays)
             return cp.asarray(left_out), cp.asarray(right_out), combined_np
 
-        except Exception:
-            # Fallback: run repair separately (safer but slower)
-            left_r = self.repair_black_regions(left, side='left')
-            right_r = self.repair_black_regions(right, side='right')
-            return cp.asarray(left_r), cp.asarray(right_r)
+        except Exception as e:
+            logging.error(f"repair_black_regions_pair failed: {e}")
+            return None
 
     def make_output_dir(self, base_dir='output'):
         """Create output directory under a parent folder as run_XXX.
@@ -967,6 +1186,14 @@ class Pano2stereo:
         
         # Stop running flag to signal threads to exit
         self.running = False
+        
+        # Stop independent frame reader
+        if hasattr(self, 'frame_reader'):
+            self.frame_reader.stop()
+        
+        # Stop depth update worker
+        if hasattr(self, 'depth_update_thread') and self.depth_update_thread.is_alive():
+            self.depth_update_thread.join(timeout=1.0)
         
         # Stop FlashDepth inference thread
         if hasattr(self, 'inference_thread') and self.inference_thread and self.inference_thread.is_alive():
@@ -1284,7 +1511,7 @@ def main():
             url=URL,
             # red_cyan = False,
             red_cyan = True,
-            max_frames = 600
+            max_frames = None
         )
         
         # Create visualization directory and initialize frame counter
@@ -1293,7 +1520,17 @@ def main():
         frame_count = 0
         
         # ================== 2. Main Loop ==================
+        # 移除帧率限制，让系统以最大速度运行
+        # target_fps = 50  # 原有的50fps限制
+        # frame_interval = 1.0 / target_fps
+        # last_frame_time = 0
+        
+        # Performance monitoring
+        fps_counter = 0
+        fps_start_time = time.time()
+        
         while generator.running:
+            current_time = time.time()            
             # If FlashDepthProcessor has finished (e.g., reached max_frames), stop the main generator loop
             try:
                 if generator.flashdepth_processor.stopped:
@@ -1304,34 +1541,43 @@ def main():
                 # Defensive: ignore attribute errors and continue
                 pass
 
-            # 2.1 Generate stereo pairs from depth and RGB                 
-            # self.pred = [depth_pred, original_frame]  # Store latest depth map & frame（Tensor, shape [H, W, C] in BGR)
-            depth, bgr = torch_to_cupy(generator.flashdepth_processor.pred[0], generator.flashdepth_processor.pred[1])
-
-            # TODO: the physical meaning of depth = 100/x (m)?? 
-            depth = generator.disparity_to_depth(disparity_map=depth, critical_depth=CRITICAL_DEPTH)  # Convert to meters and clamp
+            # 2.1 Get latest frame from FrameReader (无帧率限制)
+            # 注意：帧resize和发送到FlashDepth现在都由FrameReader直接处理，提高及时性
+            current_frame = generator.frame_reader.get_latest_frame()
+            if current_frame is None:
+                logging.warning("[MAIN LOOP] No frame available from frame reader")
+                time.sleep(0.001)  # 短暂等待，避免空转
+                continue
             
-            rgb = bgr[..., ::-1]  # Convert BGR to RGB
+            # Convert frame to CuPy for processing (FrameReader已处理resize)
+            rgb = cp.asarray(current_frame)
+            
+            # 2.2 Get the latest available depth (updated by background thread at maximum speed)
+            latest_depth = generator.get_latest_depth()
+            if latest_depth is None:
+                # logging.warning("[MAIN LOOP] No depth available, skipping frame")
+                time.sleep(0.001)  # 短暂等待
+                continue
+            
+            # Depth is pre-converted to CuPy in update_depth_from_flashdepth
+            depth_cupy = latest_depth
+            
+            # TODO: the physical meaning of depth = 100/x (m)?? 
+            depth = generator.disparity_to_depth(disparity_map=depth_cupy, critical_depth=CRITICAL_DEPTH)  # Convert to meters and clamp
+            
             # logging.info(f"[MAIN LOOP] Depth shape: {depth.shape}, RGB shape: {rgb.shape}")
             # At this point we trust FlashDepth: rgb and depth are same resolution
             with profiler.timer("[MAIN LOOP] RGB+Depth to Streaming"):
                 with profiler.timer("[Pano2stereo] RGB+Depth to Stereo"):
                     left, right = generator.generate_stereo_pair(rgb_data=rgb, depth_data=depth)
             
-                # 2.2 🔧 Image repair (single combined call - GPU-friendly)
+                # 2.3 🔧 Image repair (single combined call - GPU-friendly)
                 # Combine left and right repair into a single call to avoid duplicate GPU work
                 try:
                     with profiler.timer("[Pano2stereo] Repair_black_regions_pair"):
                         left_repaired, right_repaired, pano_repair = generator.repair_black_regions_pair(left, right)
                 except Exception as e:
-                    logging.warning(f"[MAIN LOOP] Combined repair failed, falling back to parallel repair: {e}")
-                    # Fall back to previous behavior (parallel threads) if combined fails
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-                        future_left = executor.submit(generator.repair_black_regions, left)
-                        future_right = executor.submit(generator.repair_black_regions, right)
-                        left_repaired = future_left.result()
-                        right_repaired = future_right.result()
-                        pano_repair = np.concatenate([left_repaired, right_repaired], axis=1)
+                    logging.warning(f"[MAIN LOOP] Combined repair failed: {e}")
 
                 # Save and post-process (not participating in core timing)
                 output_dir = Path(generator.outputdir) / (f"visualization/")
@@ -1339,7 +1585,7 @@ def main():
                 #     save_results_visualization(left, right, left_repaired, right_repaired, depth, output_dir, pano_repair=pano_repair, frame_idx=frame_count, generator=generator)
 
                 # Optional: fast GPU-generated red-cyan anaglyph           
-                # 2.3  Streaming
+                # 2.4  Streaming
                 if generator.stream_redcyan:  
                     with profiler.timer("[MAIN LOOP] Generating Red-Cyan Anaglyph"):
                         anaglyph_np = gpu_create_anaglyph(left_repaired, right_repaired)
@@ -1359,7 +1605,7 @@ def main():
                     with profiler.timer("[MAIN LOOP] Streaming Left-Right Pano"):
                         generator.stream_frame(pano_repair)  
             
-            # 2.4 Frame_count and save
+            # 2.5 Frame_count and save
             # save to PNGs
             if True:
                 (output_dir / "stream_frames").mkdir(parents=True, exist_ok=True)
@@ -1367,7 +1613,17 @@ def main():
                     cv2.imwrite(str(output_dir / f"stream_frames/red_cyan_{frame_count:05d}.png"), cv2.cvtColor(anaglyph_np.astype(np.uint8), cv2.COLOR_RGB2BGR))
                 else:
                     cv2.imwrite(str(output_dir / f"stream_frames/pano_{frame_count:05d}.png"), cv2.cvtColor(cp.asnumpy(pano_repair).astype(np.uint8), cv2.COLOR_RGB2BGR))
+            
             frame_count += 1
+            fps_counter += 1
+            
+            # Log FPS every 5 seconds
+            if current_time - fps_start_time >= 5.0:
+                actual_fps = fps_counter / (current_time - fps_start_time)
+                logging.info(f"[PERFORMANCE] Stereo generation FPS: {actual_fps:.2f} (maximum speed)")
+                fps_counter = 0
+                fps_start_time = current_time
+            
             # Update live profiler output in terminal (overwrites previous block)
             try:
                 profiler.render_live(max_lines=12)
