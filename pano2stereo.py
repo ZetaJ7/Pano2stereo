@@ -310,20 +310,23 @@ class FrameReader:
             ret, frame = self.cap.read()
             if not ret:
                 logging.warning("[FrameReader] Failed to read frame, attempting to reconnect...")
-                self.cap.release()
                 time.sleep(0.1)
+                try:
+                    self.cap.release()
+                except Exception:
+                    pass
                 self.cap = cv2.VideoCapture(self.url)
                 continue
-            
+
             processed_frame = self._process_frame(frame)
-            
+
             # Send to FlashDepth immediately for best timing
             self._send_to_flashdepth(processed_frame)
-            
+
             # Update local frame for main loop access
             with self.frame_lock:
                 self.current_frame = processed_frame
-            
+
             # 移除帧率控制，让系统以最大速度读取帧
             # time.sleep(1.0 / 30.0)  # 原有的30fps限制
     
@@ -493,7 +496,6 @@ class Pano2stereo:
         while self.running:
             try:
                 self.update_depth_from_flashdepth()
-                # 减少sleep时间，让深度更新更频繁
                 time.sleep(0.01)  # 100fps更新频率
             except Exception as e:
                 logging.warning(f"[DepthUpdateWorker] Error updating depth: {e}")
@@ -605,12 +607,20 @@ class Pano2stereo:
             frame = np.ascontiguousarray(frame)
             data = frame.tobytes()
 
-            # Non-blocking enqueue: if queue full, drop the frame (real-time behavior)
+            # Non-blocking enqueue: if queue full, drop the OLDEST frame and keep the NEWEST (low latency)
             try:
                 self._stream_queue.put_nowait(data)
             except queue.Full:
-                # Drop frame; count or log at debug level to avoid noisy logs
-                logging.debug("Stream queue full, dropping frame")
+                # Remove the oldest frame and insert the latest one
+                try:
+                    _ = self._stream_queue.get_nowait()
+                except Exception:
+                    pass
+                try:
+                    self._stream_queue.put_nowait(data)
+                except Exception:
+                    # If still full due to race, drop this frame silently to avoid blocking
+                    logging.debug("Stream queue still full after dropping oldest; dropping newest frame")
         except Exception as e:
             logging.error(f"Failed to prepare frame for streaming: {e}")
 
@@ -661,34 +671,36 @@ class Pano2stereo:
                 continue
 
             try:
-                # Use a lock around process access to avoid races with restart/stop
-                with self._stream_lock:
-                    if not self.stream_process or self.stream_process.poll() is not None:
-                        # Stream is dead; try restart and drop this frame
-                        logging.debug("Stream writer detected dead process; restarting")
+                with profiler.timer('stream_write'):
+                    print('[------------------------------------------------------------------]',time.time())
+                    # Use a lock around process access to avoid races with restart/stop
+                    with self._stream_lock:
+                        if not self.stream_process or self.stream_process.poll() is not None:
+                            # Stream is dead; try restart and drop this frame
+                            logging.debug("Stream writer detected dead process; restarting")
+                            try:
+                                self._restart_streaming()
+                            except Exception:
+                                pass
+                            continue
                         try:
-                            self._restart_streaming()
+                            self.stream_process.stdin.write(data)
+                        except BrokenPipeError:
+                            logging.warning("ffmpeg stdin broken in writer thread; restarting")
+                            try:
+                                self._restart_streaming()
+                            except Exception:
+                                pass
+                            continue
+                    frames_since_flush += 1
+                    if frames_since_flush >= getattr(self, '_stream_flush_interval', 4):
+                        try:
+                            with self._stream_lock:
+                                if self.stream_process and self.stream_process.stdin:
+                                    self.stream_process.stdin.flush()
                         except Exception:
                             pass
-                        continue
-                    try:
-                        self.stream_process.stdin.write(data)
-                    except BrokenPipeError:
-                        logging.warning("ffmpeg stdin broken in writer thread; restarting")
-                        try:
-                            self._restart_streaming()
-                        except Exception:
-                            pass
-                        continue
-                frames_since_flush += 1
-                if frames_since_flush >= getattr(self, '_stream_flush_interval', 4):
-                    try:
-                        with self._stream_lock:
-                            if self.stream_process and self.stream_process.stdin:
-                                self.stream_process.stdin.flush()
-                    except Exception:
-                        pass
-                    frames_since_flush = 0
+                        frames_since_flush = 0
             except Exception as e:
                 logging.debug(f"Stream writer thread error: {e}")
                 # Avoid tight-looping on error
@@ -810,16 +822,15 @@ class Pano2stereo:
         return target_coords
 
     def generate_stereo_pair(self, rgb_data, depth_data):
-        """Modified for forward mapping with depth-based z-buffering"""
-        with profiler.timer("[generate_stereo_pair] Function total"):           
-            with profiler.timer("---------------------\n[generate_stereo_pair] Depth fix on circular projection"):
-                sphere_l, sphere_r = self.sphere2pano_vectorized(depth_data)
-            with profiler.timer("[generate_stereo_pair] Revert sphere to image pixel"):
-                coords_l = self.sphere_to_image_coords(sphere_l, self.width, self.height)
-                coords_r = self.sphere_to_image_coords(sphere_r, self.width, self.height)
-            with profiler.timer("[generate_stereo_pair] Image painting (Z-Buffer)"):
-                # Delegate to helper method that performs forward mapping with z-buffer on GPU
-                return self._forward_map_zbuffer(coords_l, coords_r, rgb_data, depth_data)
+        """Modified for forward mapping with depth-based z-buffering"""         
+        with profiler.timer("---------------------\n[generate_stereo_pair] Depth fix on circular projection"):
+            sphere_l, sphere_r = self.sphere2pano_vectorized(depth_data)
+        with profiler.timer("[generate_stereo_pair] Revert sphere to image pixel"):
+            coords_l = self.sphere_to_image_coords(sphere_l, self.width, self.height)
+            coords_r = self.sphere_to_image_coords(sphere_r, self.width, self.height)
+        with profiler.timer("[generate_stereo_pair] Image painting (Z-Buffer)"):
+            # Delegate to helper method that performs forward mapping with z-buffer on GPU
+            return self._forward_map_zbuffer(coords_l, coords_r, rgb_data, depth_data)
 
     def _forward_map_zbuffer(self, coords_l, coords_r, rgb_data, depth_data):
         """Forward-map source pixels to target using a single-pass GPU z-buffer kernel.
@@ -1509,8 +1520,8 @@ def main():
             pixel=PIXEL, 
             critical_depth=CRITICAL_DEPTH, 
             url=URL,
-            # red_cyan = False,
-            red_cyan = True,
+            red_cyan = False,
+            # red_cyan = True,
             max_frames = None
         )
         
@@ -1530,7 +1541,7 @@ def main():
         fps_start_time = time.time()
         
         while generator.running:
-            current_time = time.time()            
+            time_stamp = time.time()            
             # If FlashDepthProcessor has finished (e.g., reached max_frames), stop the main generator loop
             try:
                 if generator.flashdepth_processor.stopped:
@@ -1563,7 +1574,8 @@ def main():
             depth_cupy = latest_depth
             
             # TODO: the physical meaning of depth = 100/x (m)?? 
-            depth = generator.disparity_to_depth(disparity_map=depth_cupy, critical_depth=CRITICAL_DEPTH)  # Convert to meters and clamp
+            with profiler.timer("[MAIN LOOP] Disparity -> Depth (100/x)"):
+                depth = generator.disparity_to_depth(disparity_map=depth_cupy, critical_depth=CRITICAL_DEPTH)  # Convert to meters and clamp
             
             # logging.info(f"[MAIN LOOP] Depth shape: {depth.shape}, RGB shape: {rgb.shape}")
             # At this point we trust FlashDepth: rgb and depth are same resolution
@@ -1607,29 +1619,23 @@ def main():
             
             # 2.5 Frame_count and save
             # save to PNGs
-            if True:
-                (output_dir / "stream_frames").mkdir(parents=True, exist_ok=True)
-                if generator.stream_redcyan:
-                    cv2.imwrite(str(output_dir / f"stream_frames/red_cyan_{frame_count:05d}.png"), cv2.cvtColor(anaglyph_np.astype(np.uint8), cv2.COLOR_RGB2BGR))
-                else:
-                    cv2.imwrite(str(output_dir / f"stream_frames/pano_{frame_count:05d}.png"), cv2.cvtColor(cp.asnumpy(pano_repair).astype(np.uint8), cv2.COLOR_RGB2BGR))
+            # if True:
+            #     (output_dir / "stream_frames").mkdir(parents=True, exist_ok=True)
+            #     if generator.stream_redcyan:
+            #         cv2.imwrite(str(output_dir / f"stream_frames/red_cyan_{frame_count:05d}.png"), cv2.cvtColor(anaglyph_np.astype(np.uint8), cv2.COLOR_RGB2BGR))
+            #     else:
+            #         cv2.imwrite(str(output_dir / f"stream_frames/pano_{frame_count:05d}.png"), cv2.cvtColor(cp.asnumpy(pano_repair).astype(np.uint8), cv2.COLOR_RGB2BGR))
             
             frame_count += 1
             fps_counter += 1
             
             # Log FPS every 5 seconds
-            if current_time - fps_start_time >= 5.0:
-                actual_fps = fps_counter / (current_time - fps_start_time)
-                logging.info(f"[PERFORMANCE] Stereo generation FPS: {actual_fps:.2f} (maximum speed)")
+            if time_stamp - fps_start_time >= 5.0:
+                actual_fps = fps_counter / (time_stamp - fps_start_time)
+                logging.info(f"[FPS] Stereo streaming @~{actual_fps:.2f}fps ")
                 fps_counter = 0
-                fps_start_time = current_time
+                fps_start_time = time_stamp
             
-            # Update live profiler output in terminal (overwrites previous block)
-            try:
-                profiler.render_live(max_lines=12)
-            except Exception:
-                pass
-
 
         # Memory cleanup
         del rgb, depth, left, right
