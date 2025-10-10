@@ -95,6 +95,7 @@ def load_config(file):
                 "ENABLE_RED_CYAN": yaml_config.get("enable_red_cyan", False),
                 "TARGET_HEIGHT": yaml_config.get("target_height", 540),
                 "TARGET_WIDTH": yaml_config.get("target_width", 960),
+                "TARGET_URL": yaml_config.get('target_url','rtsp://10.20.35.30:28554/stereo'),
                 # FlashDepth related configuration
                 "FLASHDEPTH_CONFIG": yaml_config.get("flashdepth", {})
             }
@@ -236,10 +237,30 @@ class FrameReader:
         self.enable_flashdepth_send = (flashdepth_processor is not None and 
                                       getattr(flashdepth_processor, 'external_frame_mode', False))
         
-        # Initialize OpenCV VideoCapture
-        self.cap = cv2.VideoCapture(url)
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Failed to open video stream: {url}")
+        # Initialize OpenCV VideoCapture with TCP transport for low latency
+        try:
+            # Force TCP transport for better stability and low latency
+            os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp'
+            self.cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
+            
+            # Set buffer-related properties for better real-time performance
+            try:
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                self.cap.set(cv2.CAP_PROP_FPS, 30)  # Limit FPS to prevent overload
+            except Exception:
+                pass
+
+            if not self.cap.isOpened():
+                raise RuntimeError(f"Failed to open video stream: {url}")
+            
+            # Pre-read and discard frames to warm decoder and clear buffer for low latency
+            for _ in range(10):
+                ret, _ = self.cap.read()
+                if not ret:
+                    break
+        except Exception as e:
+            logging.warning(f"FrameReader init warning: {e}")
+            raise RuntimeError(f"Failed to initialize video capture for {url}: {e}")
             
         # Read initial frame to get dimensions
         ret, frame = self.cap.read()
@@ -356,7 +377,18 @@ class Pano2stereo:
         # Prepare output directory and urls
         self.outputdir = self.make_output_dir()
         self.url = url
-        self.target_url = 'rtsp://10.20.35.30:28552/result'
+        # Read streaming target URL from configuration (must be provided)
+        target_url_cfg = PARAMS.get('TARGET_URL') if isinstance(PARAMS, dict) else None
+        # Fallback to env var or None
+        if not target_url_cfg:
+            target_url_cfg = os.environ.get('PANO2STEREO_TARGET_URL')
+
+        if not target_url_cfg:
+            raise ValueError("target_url not configured: set 'target_url' in configs/pano.yaml or set environment variable PANO2STEREO_TARGET_URL")
+
+        self.target_url = target_url_cfg
+        logging.info(f"[Pano2stereo] Source stream (self.url): {self.url}")
+        logging.info(f"[Pano2stereo] Target stream (self.target_url): {self.target_url}")
         self.running = True
         self.save_result = False
 

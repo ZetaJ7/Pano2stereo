@@ -75,9 +75,11 @@ Main loop: current_frame + latest_depth ──► stereo + repair ──► RTSP
 
 ## 6. 运行与使用
 
-- 配置：`configs/pano.yaml` 中设置 `URL`；`configs/flashdepth.yaml` 提供 FlashDepth 模型相关参数。
+- 配置：
+  - 在 `configs/pano.yaml` 中设置 `URL`（源流地址，程序将用作 `self.url`）和 `target_url`（处理后推流的目标地址，程序将用作 `self.target_url`）。
+  - `configs/flashdepth.yaml` 用于 FlashDepth 模型相关参数（模型路径、推理设置等）。
 - 启动：
-  ```bash
-  python pano2stereo.py
-  ```
-- 输出：RTSP 推流至 `Pano2stereo.target_url`（代码默认值：`rtsp://10.20.35.30:28552/result`），并在 `output/run_xxx/visualization/stream_frames/` 周期性落盘帧。
+```bash
+python pano2stereo.py
+```
+- 输出：RTSP 推流将发送到 `self.target_url`（由 `configs/pano.yaml` 的 `target_url` 提供）；程序启动时会在日志中同时记录源流 `self.url`（来自 `URL`）和目标流 `self.target_url`（来自 `target_url`）。
